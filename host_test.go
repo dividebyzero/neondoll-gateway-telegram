@@ -509,3 +509,158 @@ func TestInvalidEventRejected(t *testing.T) {
 		t.Fatalf("HandleEvent(empty type): got %v; want ErrInvalidEvent", err)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Lifecycle state-machine races
+// ═══════════════════════════════════════════════════════════════════════
+
+// TestConcurrentStartShutdown verifies that Shutdown called immediately
+// after Start (or during its init phase) does not panic and leaves the
+// runtime in a closed state.  Start may succeed, be interrupted, or
+// observe an already-closed runtime — any of those is valid.
+func TestConcurrentStartShutdown(t *testing.T) {
+	wasm := loadWASM(t)
+
+	r := host.NewGatewayRuntime([]string{"api.telegram.org"})
+
+	var startErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		startErr = r.Start(wasm)
+	}()
+
+	// Let Start begin executing, then interrupt.
+	time.Sleep(time.Millisecond)
+	shutdownErr := r.Shutdown()
+	wg.Wait()
+
+	if shutdownErr != nil {
+		t.Errorf("Shutdown during Start: %v", shutdownErr)
+	}
+
+	// Start could have completed before Shutdown ran, or been interrupted.
+	if startErr != nil &&
+		!errors.Is(startErr, host.ErrClosed) &&
+		!errors.Is(startErr, host.ErrAlreadyStarted) {
+		t.Errorf("Start during Shutdown race: got %v; want nil, ErrClosed, or ErrAlreadyStarted", startErr)
+	}
+
+	// The runtime must be in closed state.  A subsequent Shutdown must
+	// return nil (safe to call on closed runtime).
+	if err := r.Shutdown(); err != nil {
+		t.Errorf("second Shutdown after race: got %v; want nil", err)
+	}
+	// Operations on a closed runtime must fail with ErrClosed.
+	if err := r.Poll(); !errors.Is(err, host.ErrClosed) {
+		t.Errorf("Poll after race-shutdown: got %v; want ErrClosed", err)
+	}
+}
+
+// TestConcurrentShutdownStart verifies that calling Start after a
+// concurrent Start+Shutdown race completes does not leave the runtime
+// in a permanently closed state (new Start on a fresh runtime succeeds).
+func TestConcurrentShutdownStart(t *testing.T) {
+	wasm := loadWASM(t)
+
+	r := host.NewGatewayRuntime([]string{"api.telegram.org"})
+
+	// Provoke the race.
+	go func() { _ = r.Start(wasm) }()
+	time.Sleep(time.Millisecond)
+
+	// Shutdown while Start is in progress.
+	_ = r.Shutdown()
+
+	// A fresh runtime (new instance) must Start cleanly.
+	r2 := host.NewGatewayRuntime([]string{"api.telegram.org"})
+	if err := r2.Start(wasm); err != nil {
+		t.Fatalf("fresh Start after race: %v", err)
+	}
+	defer r2.Shutdown()
+
+	if err := r2.HandleEvent(contract.Version0, "ping", ""); err != nil {
+		t.Fatalf("HandleEvent on fresh runtime: %v", err)
+	}
+}
+
+// TestStartShutdownStartDuringInit synchronises so that Shutdown runs
+// during Start's init phase, exercising the stateStarting → stateClosed
+// transition explicitly.
+func TestStartShutdownStartDuringInit(t *testing.T) {
+	wasm := loadWASM(t)
+
+	r := host.NewGatewayRuntime([]string{"api.telegram.org"})
+	var startErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		startErr = r.Start(wasm)
+	}()
+	// Ensure Shutdown happens.  The tiny sleep puts the call inside the
+	// stateStarting window on almost every run.
+	time.Sleep(2 * time.Millisecond)
+	_ = r.Shutdown() // signals cancellation
+	wg.Wait()
+
+	if startErr != nil &&
+		!errors.Is(startErr, host.ErrClosed) &&
+		!errors.Is(startErr, host.ErrAlreadyStarted) {
+		t.Errorf("Start during Shutdown: got %v; want nil, ErrClosed, or ErrAlreadyStarted", startErr)
+	}
+
+	// Closed runtime stays closed.
+	if err := r.Poll(); !errors.Is(err, host.ErrClosed) {
+		t.Errorf("Poll after Shutdown-during-Start: got %v; want ErrClosed", err)
+	}
+}
+
+// TestRaceDetectorStartShutdownStress runs concurrent Start and Shutdown
+// in tight goroutines for the race detector to catch unprotected state
+// transitions.
+func TestRaceDetectorStartShutdownStress(t *testing.T) {
+	wasm := loadWASM(t)
+	r := host.NewGatewayRuntime([]string{"api.telegram.org"})
+
+	done := make(chan struct{})
+	var startWg, shutdownWg sync.WaitGroup
+
+	startWg.Add(1)
+	go func() {
+		defer startWg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = r.Start(wasm)
+			}
+		}
+	}()
+
+	shutdownWg.Add(1)
+	go func() {
+		defer shutdownWg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = r.Shutdown()
+			}
+		}
+	}()
+
+	// Let the race detector observe many concurrent transitions.
+	time.Sleep(50 * time.Millisecond)
+	close(done)
+	startWg.Wait()
+	shutdownWg.Wait()
+
+	// Final Shutdown must always succeed (no panic, no deadlock).
+	if err := r.Shutdown(); err != nil {
+		t.Errorf("final Shutdown after stress: %v", err)
+	}
+}

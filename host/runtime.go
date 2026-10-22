@@ -116,6 +116,7 @@ type runtimeState int
 
 const (
 	stateUninitialized runtimeState = iota
+	stateStarting
 	stateStarted
 	stateClosed
 )
@@ -137,6 +138,8 @@ func (r *GatewayRuntime) stateName(s runtimeState) string {
 	switch s {
 	case stateUninitialized:
 		return "uninitialized"
+	case stateStarting:
+		return "starting"
 	case stateStarted:
 		return "started"
 	case stateClosed:
@@ -157,19 +160,27 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 		}
 		return ErrAlreadyStarted
 	}
+	r.state = stateStarting
 	r.mu.Unlock()
 
+	// Create init-time resources as local variables.
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := wazero.NewRuntime(ctx)
 
-	// Instantiate WASI so the TinyGo-compiled module's runtime calls work.
-	if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
-		cancel()
-		_ = rt.Close(ctx)
+	// fail marks the runtime closed and cleans up init-level resources
+	// (cancel, rt).  Callers close module-level resources (mod) first.
+	fail := func(cause error) error {
 		r.mu.Lock()
 		r.state = stateClosed
 		r.mu.Unlock()
-		return fmt.Errorf("instantiate wasi: %w", err)
+		cancel()
+		_ = rt.Close(ctx)
+		return cause
+	}
+
+	// Instantiate WASI so the TinyGo-compiled module's runtime calls work.
+	if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
+		return fail(fmt.Errorf("instantiate wasi: %w", err))
 	}
 
 	// Host capability functions.
@@ -196,99 +207,63 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 		}).
 		Export("http_get")
 	if _, err := builder.Instantiate(ctx); err != nil {
-		cancel()
-		_ = rt.Close(ctx)
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("instantiate host module: %w", err)
+		return fail(fmt.Errorf("instantiate host module: %w", err))
 	}
 
 	// Compile and instantiate the guest.
 	compiled, err := rt.CompileModule(ctx, wasmBytes)
 	if err != nil {
-		cancel()
-		_ = rt.Close(ctx)
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("compile guest: %w", err)
+		return fail(fmt.Errorf("compile guest: %w", err))
 	}
 	mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig().WithName("gateway").WithStartFunctions())
 	if err != nil {
-		cancel()
-		_ = rt.Close(ctx)
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("instantiate guest: %w", err)
+		return fail(fmt.Errorf("instantiate guest: %w", err))
 	}
 
-	// Resolve guest-owned event buffer (replaces hardcoded offsets).
+	// Resolve guest-owned event buffer.
 	bufFn := mod.ExportedFunction("gateway_event_buf")
 	sizeFn := mod.ExportedFunction("gateway_event_buf_size")
 	if bufFn == nil || sizeFn == nil {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("%w: gateway_event_buf/gateway_event_buf_size", ErrMissingExport)
+		return fail(fmt.Errorf("%w: gateway_event_buf/gateway_event_buf_size", ErrMissingExport))
 	}
 	ptrRes, err := bufFn.Call(ctx)
 	if err != nil {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("resolve event buffer: %w", err)
+		return fail(fmt.Errorf("resolve event buffer: %w", err))
 	}
 	sizeRes, err := sizeFn.Call(ctx)
 	if err != nil {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("resolve event buffer size: %w", err)
+		return fail(fmt.Errorf("resolve event buffer size: %w", err))
 	}
 	eventBufPtr := uint32(ptrRes[0])
 	if eventBufPtr == 0 || uint32(sizeRes[0]) == 0 {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("%w: gateway_event_buf returned zero address/size", ErrMissingExport)
+		return fail(fmt.Errorf("%w: gateway_event_buf returned zero address/size", ErrMissingExport))
 	}
 
 	// Run guest init.
 	initFn := mod.ExportedFunction("gateway_init")
 	if initFn == nil {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("%w: gateway_init", ErrMissingExport)
+		return fail(fmt.Errorf("%w: gateway_init", ErrMissingExport))
 	}
 	if _, err := initFn.Call(ctx); err != nil {
 		_ = mod.Close(ctx)
-		_ = rt.Close(ctx)
-		cancel()
-		r.mu.Lock()
-		r.state = stateClosed
-		r.mu.Unlock()
-		return fmt.Errorf("gateway_init: %w", err)
+		return fail(fmt.Errorf("gateway_init: %w", err))
 	}
 
+	// Re-acquire lock.  If Shutdown raced during our init it set stateClosed
+	// as a signal — detect that and roll back.
 	r.mu.Lock()
+	if r.state == stateClosed {
+		_ = mod.Close(ctx)
+		cancel()
+		_ = rt.Close(ctx)
+		r.mu.Unlock()
+		return ErrClosed
+	}
 	r.runtime = rt
 	r.module = mod
 	r.ctx = ctx
@@ -302,51 +277,58 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 // Shutdown stops the guest, closes the module and runtime, and marks the
 // runtime closed.  Safe to call multiple times and on uninitialized/closed
 // runtimes (no-op).  Concurrent Shutdown calls are serialized; exactly one
-// performs the close.
+// performs the close.  If called while Start is in progress (stateStarting),
+// it signals cancellation and returns immediately — Start cleans up.
 func (r *GatewayRuntime) Shutdown() error {
 	r.mu.Lock()
-	if r.state == stateUninitialized {
+	switch r.state {
+	case stateUninitialized:
 		r.mu.Unlock()
 		return nil
-	}
-	if r.state == stateClosed {
+	case stateStarting:
+		// Start is in its init phase; signal it to abort.  Start
+		// will clean up when it re-acquires the lock.
+		r.state = stateClosed
 		r.mu.Unlock()
 		return nil
-	}
-	// We are started: transition to closed under the lock so concurrent
-	// callers observe a closed runtime and fail fast.
-	r.state = stateClosed
-	mod := r.module
-	runtime := r.runtime
-	ctx := r.ctx
-	cancel := r.cancel
-	r.mu.Unlock()
+	case stateClosed:
+		r.mu.Unlock()
+		return nil
+	case stateStarted:
+		r.state = stateClosed
+		mod := r.module
+		runtime := r.runtime
+		ctx := r.ctx
+		cancel := r.cancel
+		r.mu.Unlock()
 
-	if mod != nil {
-		if fn := mod.ExportedFunction("gateway_shutdown"); fn != nil {
-			if _, err := fn.Call(ctx); err != nil {
-				// Log the shutdown error but continue closing.
-				errcode := 0
-				if err != nil {
-					errcode = 1
+		if mod != nil {
+			if fn := mod.ExportedFunction("gateway_shutdown"); fn != nil {
+				if _, err := fn.Call(ctx); err != nil {
+					// Log the shutdown error but continue closing.
+					errcode := 0
+					if err != nil {
+						errcode = 1
+					}
+					_ = errcode
 				}
-				_ = errcode
 			}
+			_ = mod.Close(ctx)
 		}
-		_ = mod.Close(ctx)
+		if cancel != nil {
+			cancel()
+		}
+		if runtime != nil {
+			_ = runtime.Close(ctx)
+		}
+		r.mu.Lock()
+		r.module = nil
+		r.runtime = nil
+		r.ctx = nil
+		r.cancel = nil
+		r.mu.Unlock()
+		return nil
 	}
-	if cancel != nil {
-		cancel()
-	}
-	if runtime != nil {
-		_ = runtime.Close(ctx)
-	}
-	r.mu.Lock()
-	r.module = nil
-	r.runtime = nil
-	r.ctx = nil
-	r.cancel = nil
-	r.mu.Unlock()
 	return nil
 }
 
