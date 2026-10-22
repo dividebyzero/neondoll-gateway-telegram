@@ -95,6 +95,16 @@ type GatewayRuntime struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
+	// initDone is closed exactly once when Start() completes (success or
+	// failure).  Shutdown waits on it when it observes stateStarting so no
+	// initialization work remains active after Shutdown returns.
+	initDone chan struct{}
+
+	// initBarrier, if non-nil, is invoked by Start after transitioning to
+	// stateStarting and before any init work.  Tests use it to make
+	// lifecycle races deterministic.
+	initBarrier func()
+
 	// Guest-owned event buffer address/size, resolved after Start.
 	eventBufPtr uint32
 
@@ -127,7 +137,7 @@ func NewGatewayRuntime(allowedHosts []string, opts ...Option) *GatewayRuntime {
 	for _, h := range allowedHosts {
 		norm = append(norm, strings.ToLower(strings.TrimSpace(h)))
 	}
-	r := &GatewayRuntime{allowedHosts: norm}
+	r := &GatewayRuntime{allowedHosts: norm, initDone: make(chan struct{})}
 	for _, o := range opts {
 		o(r)
 	}
@@ -162,6 +172,13 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 	}
 	r.state = stateStarting
 	r.mu.Unlock()
+	// Signal Start completion on every path from here; Shutdown waits on
+	// this when it observes stateStarting.
+	defer close(r.initDone)
+
+	if r.initBarrier != nil {
+		r.initBarrier()
+	}
 
 	// Create init-time resources as local variables.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -278,7 +295,8 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 // runtime closed.  Safe to call multiple times and on uninitialized/closed
 // runtimes (no-op).  Concurrent Shutdown calls are serialized; exactly one
 // performs the close.  If called while Start is in progress (stateStarting),
-// it signals cancellation and returns immediately — Start cleans up.
+// it signals cancellation and blocks until Start has finished cleaning up,
+// so no initialization work remains active after Shutdown returns.
 func (r *GatewayRuntime) Shutdown() error {
 	r.mu.Lock()
 	switch r.state {
@@ -286,10 +304,14 @@ func (r *GatewayRuntime) Shutdown() error {
 		r.mu.Unlock()
 		return nil
 	case stateStarting:
-		// Start is in its init phase; signal it to abort.  Start
-		// will clean up when it re-acquires the lock.
+		// Start is in its init phase: signal it to abort, then wait
+		// for Start to observe the closed state and clean up.  The
+		// mutex is released before waiting so Start can make
+		// progress; initDone closes on every Start return path.
 		r.state = stateClosed
+		initDone := r.initDone
 		r.mu.Unlock()
+		<-initDone
 		return nil
 	case stateClosed:
 		r.mu.Unlock()
