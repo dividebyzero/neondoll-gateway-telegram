@@ -6,6 +6,11 @@
 
 package contract
 
+import (
+	"errors"
+	"fmt"
+)
+
 // EnvelopeVersion identifies the Gateway message protocol revision.
 type EnvelopeVersion uint32
 
@@ -36,3 +41,19 @@ const (
 	MsgTypeHTTPRequest = "http_request"
 	MsgTypeError       = "error"
 )
+
+// EncodeEvent builds the raw JSON envelope that the host writes into the
+// guest's event buffer before calling gateway_handle_event:
+//
+//	{"v":<version>,"type":"<eventType>","payload":<payload>}
+//
+// payload is a JSON fragment (or "" for none) and is embedded verbatim.
+func EncodeEvent(version EnvelopeVersion, eventType, payload string) ([]byte, error) {
+	if eventType == "" {
+		return nil, errors.New("empty event type")
+	}
+	if payload == "" {
+		return []byte(fmt.Sprintf(`{"v":%d,"type":%q}`, version, eventType)), nil
+	}
+	return []byte(fmt.Sprintf(`{"v":%d,"type":%q,"payload":%s}`, version, eventType, payload)), nil
+}
