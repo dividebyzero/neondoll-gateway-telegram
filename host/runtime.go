@@ -108,6 +108,11 @@ type GatewayRuntime struct {
 	// Guest-owned event buffer address/size, resolved after Start.
 	eventBufPtr uint32
 
+	// cfg is the optional gateway configuration (M2.2 boundary).
+	// nil means the runtime is unconfigured: projection/credential
+	// imports report nothing and appended records are not redacted.
+	cfg *contract.GatewayConfig
+
 	// Recorded host-observable results (for feasibility tests).
 	Log      []string
 	Outbound []contract.GatewayMessage
@@ -120,6 +125,16 @@ type Option func(*GatewayRuntime)
 // Tests inject the transport of an httptest TLS server here.
 func WithHTTPTransport(rt http.RoundTripper) Option {
 	return func(r *GatewayRuntime) { r.httpTransport = rt }
+}
+
+// WithConfig supplies the gateway configuration (M2.2 config boundary).
+// The config is validated during Start with explicit errors; the guest
+// receives a redacted projection via the config_projection import and
+// host-owned credentials (Telegram.BotToken) exclusively through the
+// mediated telegram_token import.  Optional: without it the runtime is
+// unconfigured and both imports report nothing.
+func WithConfig(cfg contract.GatewayConfig) Option {
+	return func(r *GatewayRuntime) { r.cfg = &cfg }
 }
 
 type runtimeState int
@@ -180,6 +195,19 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 		r.initBarrier()
 	}
 
+	// Validate the optional gateway configuration before any init work.
+	// Failures are explicit and never carry secret values.  A failed
+	// Start leaves the runtime closed (initDone is closed by the defer
+	// above, so Shutdown unblocks).
+	if r.cfg != nil {
+		if err := r.cfg.Validate(); err != nil {
+			r.mu.Lock()
+			r.state = stateClosed
+			r.mu.Unlock()
+			return err
+		}
+	}
+
 	// Create init-time resources as local variables.
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := wazero.NewRuntime(ctx)
@@ -223,6 +251,16 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 			r.hostHTTPGet(ctx, m, urlPtr, urlLen, respBuf, respMax, resultPtr)
 		}).
 		Export("http_get")
+	builder.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, ptr, maxLen uint32) int32 {
+			return r.hostConfigProjection(m, ptr, maxLen)
+		}).
+		Export("config_projection")
+	builder.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, ptr, maxLen uint32) int32 {
+			return r.hostTelegramToken(m, ptr, maxLen)
+		}).
+		Export("telegram_token")
 	if _, err := builder.Instantiate(ctx); err != nil {
 		return fail(fmt.Errorf("instantiate host module: %w", err))
 	}
@@ -559,16 +597,75 @@ func (r *GatewayRuntime) writeHTTPResult(m api.Module, resultPtr uint32, written
 	_ = m.Memory().Write(resultPtr, buf[:])
 }
 
+// hostConfigProjection writes the redacted JSON projection of the
+// gateway configuration into guest memory.  Returns the number of bytes
+// written (0 when unconfigured, buffer too small, or write fails).  The
+// projection never contains the BotToken (json:"-") — the token is only
+// reachable through the mediated telegram_token import.
+func (r *GatewayRuntime) hostConfigProjection(m api.Module, ptr, maxLen uint32) int32 {
+	cfg := r.config()
+	if cfg == nil || maxLen == 0 {
+		return 0
+	}
+	proj := cfg.Projection()
+	if proj == "" {
+		return 0
+	}
+	n := uint32(len(proj))
+	if n > maxLen {
+		n = maxLen
+	}
+	if !m.Memory().Write(ptr, []byte(proj[:n])) {
+		return 0
+	}
+	return int32(n)
+}
+
+// hostTelegramToken is the mediated credential capability: it copies the
+// host-owned BotToken into guest memory on demand.  Returns the number
+// of bytes written (0 when unconfigured, no token, buffer too small, or
+// write fails).  A too-small buffer is rejected rather than truncated so
+// a guest can never receive a partial secret silently.  The token is
+// never part of any projection, log, or outbound record recorded by the
+// host.
+func (r *GatewayRuntime) hostTelegramToken(m api.Module, ptr, maxLen uint32) int32 {
+	cfg := r.config()
+	if cfg == nil || cfg.Telegram.BotToken == "" || maxLen == 0 {
+		return 0
+	}
+	tok := cfg.Telegram.BotToken
+	if uint32(len(tok)) > maxLen {
+		return 0
+	}
+	if !m.Memory().Write(ptr, []byte(tok)) {
+		return 0
+	}
+	return int32(len(tok))
+}
+
 func (r *GatewayRuntime) appendLog(msg string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cfg != nil {
+		msg = r.cfg.Redact(msg)
+	}
 	r.Log = append(r.Log, msg)
 }
 
 func (r *GatewayRuntime) appendOutbound(msg contract.GatewayMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cfg != nil {
+		msg.Payload = []byte(r.cfg.Redact(string(msg.Payload)))
+	}
 	r.Outbound = append(r.Outbound, msg)
+}
+
+// config returns the configured GatewayConfig, or nil when unconfigured.
+func (r *GatewayRuntime) config() *contract.GatewayConfig {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cfg
 }
 
 func readMem(m api.Module, ptr, size uint32) string {

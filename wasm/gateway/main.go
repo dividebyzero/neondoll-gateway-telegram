@@ -34,6 +34,10 @@ var eventBuf [eventBufSize]byte
 // directly to hostHTTPGet so it is implicitly guest-owned.
 var respBuf [respBufSize]byte
 
+// cfgBuf is a guest-owned scratch buffer for the config projection and
+// credential capability probes.
+var cfgBuf [1024]byte
+
 //export gateway_event_buf
 func gateway_event_buf() uint32 { return uint32(uintptr(unsafe.Pointer(&eventBuf[0]))) }
 
@@ -56,6 +60,19 @@ func hostHTTPGet(urlPtr uint32, urlLen uint32, respBuf uint32, respMax uint32, r
 //go:wasmimport gateway_host outgoing
 func hostOutgoing(ptr uint32, len uint32)
 
+//go:wasmimport gateway_host config_projection
+// hostConfigProjection copies the redacted config projection JSON into
+// the guest buffer at ptr (max maxLen bytes).  Returns bytes written
+// (0 when unconfigured).
+func hostConfigProjection(ptr uint32, maxLen uint32) int32
+
+//go:wasmimport gateway_host telegram_token
+// hostTelegramToken is the mediated credential capability: it copies the
+// host-owned bot token into the guest buffer at ptr (max maxLen bytes).
+// Returns bytes written (0 when unconfigured).  The token is host-owned
+// and never part of the config projection.
+func hostTelegramToken(ptr uint32, maxLen uint32) int32
+
 // ═══════════════════════════════════════════════════════════════════════
 // Guest exports  —  lifecycle
 // ═══════════════════════════════════════════════════════════════════════
@@ -63,6 +80,24 @@ func hostOutgoing(ptr uint32, len uint32)
 //export gateway_init
 func gateway_init() int32 {
 	emitLog("gateway_init: module ready (abi 2, guest-owned buffers)")
+
+	// Fetch the redacted config projection via the mediated import.
+	// hostConfigProjection returns 0 when the runtime is unconfigured.
+	n := hostConfigProjection(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
+	if n > 0 {
+		emitLog("gateway_init: config projection ok (len=" + itoa(uint32(n)) + ")")
+	} else {
+		emitLog("gateway_init: no config projection")
+	}
+
+	// Probe the credential capability WITHOUT logging the token itself.
+	// Only presence is reported; the secret stays host-owned.
+	n = hostTelegramToken(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
+	if n > 0 {
+		emitLog("gateway_init: telegram token capability ready (len=" + itoa(uint32(n)) + ")")
+	} else {
+		emitLog("gateway_init: no telegram token")
+	}
 	return 0
 }
 
@@ -113,6 +148,21 @@ func gateway_handle_event(ptr uint32, size uint32) int32 {
 			msg += `,"head":"` + escStr(raw) + `"`
 		}
 		msg += `}`
+		hostOutgoing(stringPtr(msg), uint32(len(msg)))
+		return 0
+
+	// Token capability probe: requests the host-owned credential and
+	// echoes it verbatim.  The host MUST redact the secret before any
+	// log or outbound record leaves the boundary — this event proves
+	// both the mediated capability and host-side secret redaction.
+	case strings.Contains(payload, `"type":"echo_token"`):
+		n := hostTelegramToken(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
+		if n <= 0 {
+			emitLog("handle_event: echo_token with no token available")
+			return 0
+		}
+		tok := string(cfgBuf[:n])
+		msg := `{"type":"token_echo","token":"` + escStr(tok) + `"}`
 		hostOutgoing(stringPtr(msg), uint32(len(msg)))
 		return 0
 
