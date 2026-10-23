@@ -15,9 +15,9 @@
 package contract
 
 import (
-    "encoding/json"
-    "fmt"
-    "strings"
+	"encoding/json"
+	"fmt"
+	"strings"
 )
 
 // ConfigVersion identifies this contract revision.
@@ -34,20 +34,20 @@ const MaxAllowedTimeout uint32 = 50
 // ═══════════════════════════════════════════════════════════════════════
 
 type GatewayConfig struct {
-    Version  int              `json:"version"`
-    Telegram TelegramConfig   `json:"telegram,omitempty"`
-    Polling  PollingConfig    `json:"polling,omitempty"`
+	Version  int            `json:"version"`
+	Telegram TelegramConfig `json:"telegram,omitempty"`
+	Polling  PollingConfig  `json:"polling,omitempty"`
 }
 
 type TelegramConfig struct {
-    // BotToken authenticates with the Telegram Bot API.
-    // Host-owned secret (json:"-" → never serialised in projections).
-    BotToken string `json:"-"`
+	// BotToken authenticates with the Telegram Bot API.
+	// Host-owned secret (json:"-" → never serialised in projections).
+	BotToken string `json:"-"`
 }
 
 type PollingConfig struct {
-    TimeoutSeconds uint32   `json:"timeout_seconds,omitempty"`
-    AllowedUpdates []string `json:"allowed_updates,omitempty"`
+	TimeoutSeconds uint32   `json:"timeout_seconds,omitempty"`
+	AllowedUpdates []string `json:"allowed_updates,omitempty"`
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -58,25 +58,25 @@ type PollingConfig struct {
 // polling limits.  Returns nil on success.  Error text never includes
 // the BotToken value.
 func (c *GatewayConfig) Validate() error {
-    if c.Version != ConfigVersion {
-        return fmt.Errorf("config: version %d unsupported (want %d)",
-            c.Version, ConfigVersion)
-    }
+	if c.Version != ConfigVersion {
+		return fmt.Errorf("config: version %d unsupported (want %d)",
+			c.Version, ConfigVersion)
+	}
 
-    tok := strings.TrimSpace(c.Telegram.BotToken)
-    if tok == "" {
-        return fmt.Errorf("config: telegram bot token missing")
-    }
-    if !strings.Contains(tok, ":") {
-        return fmt.Errorf("config: telegram bot token malformed (missing colon)")
-    }
+	tok := strings.TrimSpace(c.Telegram.BotToken)
+	if tok == "" {
+		return fmt.Errorf("config: telegram bot token missing")
+	}
+	if !strings.Contains(tok, ":") {
+		return fmt.Errorf("config: telegram bot token malformed (missing colon)")
+	}
 
-    if c.Polling.TimeoutSeconds > MaxAllowedTimeout {
-        return fmt.Errorf("config: polling timeout %ds exceeds max %ds",
-            c.Polling.TimeoutSeconds, MaxAllowedTimeout)
-    }
+	if c.Polling.TimeoutSeconds > MaxAllowedTimeout {
+		return fmt.Errorf("config: polling timeout %ds exceeds max %ds",
+			c.Polling.TimeoutSeconds, MaxAllowedTimeout)
+	}
 
-    return nil
+	return nil
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -89,10 +89,10 @@ func (c *GatewayConfig) Validate() error {
 // defence-in-depth sanitisation of logs, outbound messages, and error
 // strings before they leave the host boundary.
 func (c *GatewayConfig) Redact(s string) string {
-    if c == nil || c.Telegram.BotToken == "" {
-        return s
-    }
-    return strings.ReplaceAll(s, c.Telegram.BotToken, "[REDACTED]")
+	if c == nil || c.Telegram.BotToken == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, c.Telegram.BotToken, "[REDACTED]")
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -105,14 +105,14 @@ func (c *GatewayConfig) Redact(s string) string {
 //
 // Call on nil → returns "{}".
 func (c *GatewayConfig) Projection() string {
-    if c == nil {
-        return "{}"
-    }
-    b, err := json.Marshal(c)
-    if err != nil {
-        // Struct contains only marshalable, omitempty-tagged fields;
-        // treat an encode failure as a programming error.
-        return "{}"
-    }
-    return string(b)
+	if c == nil {
+		return "{}"
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		// Struct contains only marshalable, omitempty-tagged fields;
+		// treat an encode failure as a programming error.
+		return "{}"
+	}
+	return string(b)
 }

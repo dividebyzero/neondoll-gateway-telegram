@@ -60,17 +60,19 @@ func hostHTTPGet(urlPtr uint32, urlLen uint32, respBuf uint32, respMax uint32, r
 //go:wasmimport gateway_host outgoing
 func hostOutgoing(ptr uint32, len uint32)
 
-//go:wasmimport gateway_host config_projection
 // hostConfigProjection copies the redacted config projection JSON into
 // the guest buffer at ptr (max maxLen bytes).  Returns bytes written
 // (0 when unconfigured).
+//
+//go:wasmimport gateway_host config_projection
 func hostConfigProjection(ptr uint32, maxLen uint32) int32
 
-//go:wasmimport gateway_host telegram_token
 // hostTelegramToken is the mediated credential capability: it copies the
 // host-owned bot token into the guest buffer at ptr (max maxLen bytes).
 // Returns bytes written (0 when unconfigured).  The token is host-owned
 // and never part of the config projection.
+//
+//go:wasmimport gateway_host telegram_token
 func hostTelegramToken(ptr uint32, maxLen uint32) int32
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -101,15 +103,16 @@ func gateway_init() int32 {
 	return 0
 }
 
-//export gateway_handle_event
-//
 // gateway_handle_event receives an inbound event written by the host into
 // the guest-owned event buffer.  The guest reads the payload and may
 // call host functions or emit outgoing messages in response.
 //
 // Expected payload types (M2.1 feasibility):
-//   ping         –  emits a deterministic pong outbound
-//   http_request –  calls hostHTTPGet, emits an http_result outbound
+//
+//	ping         –  emits a deterministic pong outbound
+//	http_request –  calls hostHTTPGet, emits an http_result outbound
+//
+//export gateway_handle_event
 func gateway_handle_event(ptr uint32, size uint32) int32 {
 	payload := readString(ptr, size)
 
