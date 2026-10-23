@@ -1,0 +1,28 @@
+# Binaries
+*.test
+*.out
+*.exe
+gateway-host
+gateway.wasm
+gateway-host-*
+
+# Build output
+/build/
+# Keep prebuilt feasibility artifact (host_test.go loads it; rebuildable via TinyGo)
+/wasm/build/*
+!/wasm/build/gateway.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Go
+/vendor/
+
+# Module cache (in-module wasm guest)
+wasm/gateway/go.sum
+
+# OS files
+.DS_Store
+Thumbs.db
