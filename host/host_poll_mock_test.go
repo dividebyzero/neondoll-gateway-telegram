@@ -172,7 +172,7 @@ func TestTelegramPollMockServer(t *testing.T) {
 					{"update_id":5,"message":{"message_id":20,"chat":{"id":300,"type":"private"},"date":1700000010,"text":"a"}}
 				]}`))
 			case 2:
-				if offset == "" || offset == "0" {
+				if offset != "6" {
 					t.Errorf("second call offset=%q, want 6", offset)
 				}
 				_, _ = w.Write([]byte(`{"ok":true,"result":[
@@ -193,8 +193,13 @@ func TestTelegramPollMockServer(t *testing.T) {
 		}
 
 		// Second poll: offset should have advanced past 5
+		// Server returns the same update_id=5 (already processed) — must be skipped.
 		if err := r.Poll(); err != nil {
 			t.Fatalf("Poll #2: %v", err)
+		}
+		envs2 := outboundEnvelopes(t, r)
+		if len(envs2) != len(envs) {
+			t.Fatalf("poll #2 events: got %d (accumulated), want %d (no new events)", len(envs2), len(envs))
 		}
 	})
 

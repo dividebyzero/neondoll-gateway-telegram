@@ -6,31 +6,31 @@ package contract
 
 // UpdatesResponse is the top-level Telegram Bot API getUpdates response.
 type UpdatesResponse struct {
-	OK     bool            `json:"ok"`
+	OK     bool             `json:"ok"`
 	Result []TelegramUpdate `json:"result"`
 }
 
 // TelegramUpdate is a single update from the Telegram Bot API.
 type TelegramUpdate struct {
-	UpdateID int64        `json:"update_id"`
+	UpdateID int64            `json:"update_id"`
 	Message  *TelegramMessage `json:"message,omitempty"`
 }
 
 // TelegramMessage is a message within a Telegram update.
 type TelegramMessage struct {
-	MessageID int64        `json:"message_id"`
-	From      *TelegramUser   `json:"from,omitempty"`
-	Chat      TelegramChat    `json:"chat"`
+	MessageID int64         `json:"message_id"`
+	From      *TelegramUser `json:"from,omitempty"`
+	Chat      TelegramChat  `json:"chat"`
 	Date      int64         `json:"date"`
 	Text      string        `json:"text,omitempty"`
 }
 
 // TelegramUser represents a Telegram user.
 type TelegramUser struct {
-	ID        int64  `json:"id"`
-	IsBot      bool   `json:"is_bot"`
-	FirstName  string `json:"first_name"`
-	LastName   string `json:"last_name,omitempty"`
+	ID           int64  `json:"id"`
+	IsBot        bool   `json:"is_bot"`
+	FirstName    string `json:"first_name"`
+	LastName     string `json:"last_name,omitempty"`
 	LanguageCode string `json:"language_code,omitempty"`
 }
 

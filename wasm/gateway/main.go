@@ -39,6 +39,8 @@ func hostEmitLog(ptr, size uint32)
 
 var logBuf [256]byte
 
+var configBuf [1024]byte
+
 func emitLog(msg string) {
 	src := unsafe.StringData(msg)
 	hostEmitLog(uint32(uintptr(unsafe.Pointer(src))), uint32(len(msg)))
@@ -49,11 +51,11 @@ func emitOutgoing(data []byte) {
 }
 
 func readConfig() (cfg string, ok bool) {
-	n := hostConfigProjection(uint32(uintptr(unsafe.Pointer(&logBuf[0]))), 256)
+	n := hostConfigProjection(uint32(uintptr(unsafe.Pointer(&configBuf[0]))), 1024)
 	if n <= 0 {
 		return "", false
 	}
-	cfg = string(append([]byte(nil), logBuf[:n]...))
+	cfg = string(append([]byte(nil), configBuf[:n]...))
 	return cfg, true
 }
 
@@ -231,7 +233,7 @@ func gatewayPoll() int32 {
 		Result []struct {
 			UpdateID int64 `json:"update_id"`
 			Message  *struct {
-				MessageID int64  `json:"message_id"`
+				MessageID int64 `json:"message_id"`
 				From      *struct {
 					ID        int64  `json:"id"`
 					FirstName string `json:"first_name"`
@@ -254,9 +256,10 @@ func gatewayPoll() int32 {
 		return 0
 	}
 	for _, u := range tgResp.Result {
-		if u.UpdateID >= offset {
-			offset = u.UpdateID + 1
+		if u.UpdateID < offset {
+			continue
 		}
+		offset = u.UpdateID + 1
 		if u.Message == nil || u.Message.Text == "" {
 			continue
 		}
@@ -301,8 +304,6 @@ func gatewayPoll() int32 {
 
 var responseBuf [4096]byte
 
-
-
 // ── Event handler ─────────────────────────────────────────────────────────
 
 //export gateway_handle_event
@@ -315,9 +316,9 @@ func gatewayHandleEvent(ptr uint32, size uint32) int32 {
 	eventData := string(append([]byte(nil), rawMem(ptr, size)...))
 
 	var ev struct {
-		V       int              `json:"v"`
-		Type    string           `json:"type"`
-		Payload json.RawMessage  `json:"payload"`
+		V       int             `json:"v"`
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
 	}
 	if err := json.Unmarshal([]byte(eventData), &ev); err != nil {
 		emitLog("gateway_handle_event: json error: " + err.Error())
