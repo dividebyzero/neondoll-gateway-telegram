@@ -60,33 +60,33 @@ const (
 
 // HTTP result error codes written to the guest result struct.
 const (
-	httpErrOK          = 0
-	httpErrInvalidURL  = 1 // URL could not be parsed
-	httpErrBlocked     = 2 // scheme or hostname violates destination policy
-	httpErrRedirect    = 3 // redirect destination violates destination policy
-	httpErrNetwork     = 4 // network/request error
-	httpErrTooLarge    = 5 // response body exceeds the guest's respMax
-	httpErrStatus      = 6 // non-2xx HTTP status; status field carries it
-	httpErrMemWrite    = 7 // could not write result/body into guest memory
-	httpErrReadBody    = 8 // failed while reading response body
+	httpErrOK         = 0
+	httpErrInvalidURL = 1 // URL could not be parsed
+	httpErrBlocked    = 2 // scheme or hostname violates destination policy
+	httpErrRedirect   = 3 // redirect destination violates destination policy
+	httpErrNetwork    = 4 // network/request error
+	httpErrTooLarge   = 5 // response body exceeds the guest's respMax
+	httpErrStatus     = 6 // non-2xx HTTP status; status field carries it
+	httpErrMemWrite   = 7 // could not write result/body into guest memory
+	httpErrReadBody   = 8 // failed while reading response body
 )
 
 // Lifecycle sentinel errors returned by public methods.
 var (
-	ErrNotStarted        = errors.New("gateway runtime: not started")
-	ErrAlreadyStarted    = errors.New("gateway runtime: already started")
-	ErrClosed            = errors.New("gateway runtime: closed")
-	ErrShuttingDown      = errors.New("gateway runtime: shutting down")
-	ErrInvalidEvent      = errors.New("gateway runtime: invalid event")
-	ErrMissingExport     = errors.New("gateway runtime: guest missing required export")
-	errRedirectBlocked   = errors.New("gateway runtime: redirect destination blocked")
+	ErrNotStarted      = errors.New("gateway runtime: not started")
+	ErrAlreadyStarted  = errors.New("gateway runtime: already started")
+	ErrClosed          = errors.New("gateway runtime: closed")
+	ErrShuttingDown    = errors.New("gateway runtime: shutting down")
+	ErrInvalidEvent    = errors.New("gateway runtime: invalid event")
+	ErrMissingExport   = errors.New("gateway runtime: guest missing required export")
+	errRedirectBlocked = errors.New("gateway runtime: redirect destination blocked")
 )
 
 // GatewayRuntime mediates the external WASM Gateway module.
 type GatewayRuntime struct {
-	allowedHosts []string
+	allowedHosts  []string
 	httpTransport http.RoundTripper // injectable transport (tests use TLS test server)
-	httpClient   *http.Client      // built lazily from httpTransport + policy
+	httpClient    *http.Client      // built lazily from httpTransport + policy
 
 	mu      sync.Mutex
 	state   runtimeState
@@ -108,6 +108,11 @@ type GatewayRuntime struct {
 	// Guest-owned event buffer address/size, resolved after Start.
 	eventBufPtr uint32
 
+	// cfg is the optional gateway configuration (M2.2 boundary).
+	// nil means the runtime is unconfigured: projection/credential
+	// imports report nothing and appended records are not redacted.
+	cfg *contract.GatewayConfig
+
 	// Recorded host-observable results (for feasibility tests).
 	Log      []string
 	Outbound []contract.GatewayMessage
@@ -120,6 +125,16 @@ type Option func(*GatewayRuntime)
 // Tests inject the transport of an httptest TLS server here.
 func WithHTTPTransport(rt http.RoundTripper) Option {
 	return func(r *GatewayRuntime) { r.httpTransport = rt }
+}
+
+// WithConfig supplies the gateway configuration (M2.2 config boundary).
+// The config is validated during Start with explicit errors; the guest
+// receives a redacted projection via the config_projection import and
+// host-owned credentials (Telegram.BotToken) exclusively through the
+// mediated telegram_token import.  Optional: without it the runtime is
+// unconfigured and both imports report nothing.
+func WithConfig(cfg contract.GatewayConfig) Option {
+	return func(r *GatewayRuntime) { r.cfg = &cfg }
 }
 
 type runtimeState int
@@ -180,6 +195,19 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 		r.initBarrier()
 	}
 
+	// Validate the optional gateway configuration before any init work.
+	// Failures are explicit and never carry secret values.  A failed
+	// Start leaves the runtime closed (initDone is closed by the defer
+	// above, so Shutdown unblocks).
+	if r.cfg != nil {
+		if err := r.cfg.Validate(); err != nil {
+			r.mu.Lock()
+			r.state = stateClosed
+			r.mu.Unlock()
+			return err
+		}
+	}
+
 	// Create init-time resources as local variables.
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := wazero.NewRuntime(ctx)
@@ -223,6 +251,16 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 			r.hostHTTPGet(ctx, m, urlPtr, urlLen, respBuf, respMax, resultPtr)
 		}).
 		Export("http_get")
+	builder.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, ptr, maxLen uint32) int32 {
+			return r.hostConfigProjection(m, ptr, maxLen)
+		}).
+		Export("config_projection")
+	builder.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, ptr, maxLen uint32) int32 {
+			return r.hostTelegramToken(m, ptr, maxLen)
+		}).
+		Export("telegram_token")
 	if _, err := builder.Instantiate(ctx); err != nil {
 		return fail(fmt.Errorf("instantiate host module: %w", err))
 	}
@@ -369,11 +407,30 @@ func (r *GatewayRuntime) ABIVersion() (int32, error) {
 	if fn == nil {
 		return 0, fmt.Errorf("%w: gateway_abi_version", ErrMissingExport)
 	}
-	res, err := fn.Call(ctx)
+	res, err := r.callGuest(ctx, fn)
 	if err != nil {
 		return 0, err
 	}
 	return int32(res[0]), nil
+}
+
+// callGuest invokes a guest function and normalizes lifecycle races.
+// If Shutdown closes the module while the call is in flight, the engine
+// error (e.g. "module closed with exit_code(0)") must be reported as
+// ErrClosed so callers can distinguish intentional shutdown from a real
+// guest failure; the test contract forbids leaking raw close errors.
+func (r *GatewayRuntime) callGuest(ctx context.Context, fn api.Function, args ...uint64) ([]uint64, error) {
+	res, err := fn.Call(ctx, args...)
+	if err != nil {
+		r.mu.Lock()
+		closed := r.state == stateClosed
+		r.mu.Unlock()
+		if closed {
+			return nil, fmt.Errorf("%w: %v", ErrClosed, err)
+		}
+		return nil, err
+	}
+	return res, nil
 }
 
 // HandleEvent writes an inbound event envelope into the guest-owned event
@@ -408,7 +465,7 @@ func (r *GatewayRuntime) HandleEvent(version contract.EnvelopeVersion, eventType
 	if fn == nil {
 		return fmt.Errorf("%w: gateway_handle_event", ErrMissingExport)
 	}
-	if _, err := fn.Call(ctx, uint64(eventBufPtr), uint64(len(enc))); err != nil {
+	if _, err := r.callGuest(ctx, fn, uint64(eventBufPtr), uint64(len(enc))); err != nil {
 		return err
 	}
 	return nil
@@ -429,7 +486,7 @@ func (r *GatewayRuntime) Poll() error {
 	if fn == nil {
 		return fmt.Errorf("%w: gateway_poll", ErrMissingExport)
 	}
-	if _, err := fn.Call(ctx); err != nil {
+	if _, err := r.callGuest(ctx, fn); err != nil {
 		return err
 	}
 	return nil
@@ -559,16 +616,77 @@ func (r *GatewayRuntime) writeHTTPResult(m api.Module, resultPtr uint32, written
 	_ = m.Memory().Write(resultPtr, buf[:])
 }
 
+// hostConfigProjection writes the redacted JSON projection of the
+// gateway configuration into guest memory.  The projection never
+// contains the BotToken (json:"-") — the token is only reachable
+// through the mediated telegram_token import.  Returns the number of
+// bytes written (0 when unconfigured, the projection does not fit, or
+// the write fails).  The write is all-or-nothing: an oversized
+// projection is rejected in full, never truncated to a partial JSON
+// fragment.
+func (r *GatewayRuntime) hostConfigProjection(m api.Module, ptr, maxLen uint32) int32 {
+	cfg := r.config()
+	if cfg == nil || maxLen == 0 {
+		return 0
+	}
+	proj := cfg.Projection()
+	if proj == "" {
+		return 0
+	}
+	if uint32(len(proj)) > maxLen {
+		return 0
+	}
+	if !m.Memory().Write(ptr, []byte(proj)) {
+		return 0
+	}
+	return int32(len(proj))
+}
+
+// hostTelegramToken is the mediated credential capability: it copies the
+// host-owned BotToken into guest memory on demand.  Returns the number
+// of bytes written (0 when unconfigured, no token, buffer too small, or
+// write fails).  A too-small buffer is rejected rather than truncated so
+// a guest can never receive a partial secret silently.  The token is
+// never part of any projection, log, or outbound record recorded by the
+// host.
+func (r *GatewayRuntime) hostTelegramToken(m api.Module, ptr, maxLen uint32) int32 {
+	cfg := r.config()
+	if cfg == nil || cfg.Telegram.BotToken == "" || maxLen == 0 {
+		return 0
+	}
+	tok := cfg.Telegram.BotToken
+	if uint32(len(tok)) > maxLen {
+		return 0
+	}
+	if !m.Memory().Write(ptr, []byte(tok)) {
+		return 0
+	}
+	return int32(len(tok))
+}
+
 func (r *GatewayRuntime) appendLog(msg string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cfg != nil {
+		msg = r.cfg.Redact(msg)
+	}
 	r.Log = append(r.Log, msg)
 }
 
 func (r *GatewayRuntime) appendOutbound(msg contract.GatewayMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cfg != nil {
+		msg.Payload = []byte(r.cfg.Redact(string(msg.Payload)))
+	}
 	r.Outbound = append(r.Outbound, msg)
+}
+
+// config returns the configured GatewayConfig, or nil when unconfigured.
+func (r *GatewayRuntime) config() *contract.GatewayConfig {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cfg
 }
 
 func readMem(m api.Module, ptr, size uint32) string {
