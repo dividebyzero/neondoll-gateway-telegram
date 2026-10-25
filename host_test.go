@@ -84,7 +84,24 @@ func containsMsg(msgs []string, want string) bool {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestTelegramPollingViability(t *testing.T) {
-	r := startRuntime(t, []string{"api.telegram.org"})
+	// Mock server returns empty result (simulating Telegram with no messages).
+	empty := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"result":[]}`))
+	}))
+	t.Cleanup(empty.Close)
+
+	r := startRuntime(t, []string{"127.0.0.1"},
+		host.WithConfig(contract.GatewayConfig{
+			Version: contract.ConfigVersion,
+			Telegram: contract.TelegramConfig{
+				BotToken: "test:inert",
+				Host:     empty.URL,
+			},
+			Polling: contract.PollingConfig{TimeoutSeconds: 3},
+		}),
+		host.WithHTTPTransport(empty.Client().Transport.(*http.Transport)),
+	)
 
 	// Init ran: deterministic result of gateway_init via guest log line.
 	if len(r.Log) == 0 {
@@ -106,20 +123,28 @@ func TestTelegramPollingViability(t *testing.T) {
 		t.Fatalf("outbound after ping: got %q; want deterministic pong", got[0])
 	}
 
-	// Three poll cycles produce three ticks.
+	// Three poll cycles execute without error (HTTP to mock server succeeds,
+	// returns empty result — no events produced because no Telegram messages).
 	for i := 0; i < 3; i++ {
 		if err := r.Poll(); err != nil {
 			t.Fatalf("Poll #%d: %v", i+1, err)
 		}
 	}
+	// Only the pong from the ping event should be present.
 	got = outboundPayloads(r)
-	if len(got) != 4 {
-		t.Fatalf("outbound after 3 polls: got %d messages %v; want 4 (1 pong + 3 ticks)", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("outbound after 3 polls: got %d messages %v; want 1 (only pong, HTTP returned empty updates)",
+			len(got), got)
 	}
-	for i := 1; i <= 3; i++ {
-		if got[i] != `{"type":"poll_tick"}` {
-			t.Fatalf("poll #%d tick: got %q; want poll_tick", i, got[i])
+	// Verify polls executed via guest logs.
+	var pollCount int
+	for _, l := range r.Log {
+		if strings.Contains(l, "gateway_poll:") {
+			pollCount++
 		}
+	}
+	if pollCount < 3 {
+		t.Fatalf("gateway_poll log lines: got %d; want at least 3", pollCount)
 	}
 }
 

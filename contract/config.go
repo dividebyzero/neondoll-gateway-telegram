@@ -43,6 +43,9 @@ type TelegramConfig struct {
 	// BotToken authenticates with the Telegram Bot API.
 	// Host-owned secret (json:"-" → never serialised in projections).
 	BotToken string `json:"-"`
+	// Host is the Telegram Bot API base URL (scheme + host, no trailing slash).
+	// Empty → defaults to "https://api.telegram.org".
+	Host string `json:"host,omitempty"`
 }
 
 type PollingConfig struct {
