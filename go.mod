@@ -3,7 +3,7 @@ module github.com/dividebyzero/neondoll-gateway-telegram
 go 1.25.0
 
 require (
-	github.com/Neon-Dolls/neondoll v0.0.0-20261027093221-290726059e5c
+	github.com/Neon-Dolls/neondoll v0.0.0-20261027092823-5caa4e1c9599
 	github.com/tetratelabs/wazero v1.8.1
 )
 

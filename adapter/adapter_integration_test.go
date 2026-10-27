@@ -27,11 +27,11 @@ type integrationIngress struct {
 	decisions []sessionevent.Event
 }
 
-func (*integrationIngress) ResolvePlatformSession(context.Context, string) (*gateway.SessionRoute, error) {
-	return &gateway.SessionRoute{SessionID: "session-telegram", ExternalConversationRef: "telegram/chat/9001"}, nil
+func (*integrationIngress) ResolvePlatformSession(context.Context, string) (session.ID, error) {
+	return "session-telegram", nil
 }
-func (*integrationIngress) SessionRoute(context.Context, session.ID) (*gateway.SessionRoute, error) {
-	return &gateway.SessionRoute{SessionID: "session-telegram", ExternalConversationRef: "telegram/chat/9001"}, nil
+func (*integrationIngress) ExternalConversationRef(context.Context, session.ID) (string, error) {
+	return "telegram/chat/9001", nil
 }
 func (i *integrationIngress) HandleLegacy(_ context.Context, _ session.ID, sender gateway.VerifiedSender, event *events.Event) (*events.Event, error) {
 	i.mu.Lock()

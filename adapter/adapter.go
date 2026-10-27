@@ -16,6 +16,7 @@ import (
 	"github.com/Neon-Dolls/neondoll/Core/ExternalIdentity"
 	"github.com/Neon-Dolls/neondoll/Core/Gateway"
 	"github.com/Neon-Dolls/neondoll/Core/PermissionRequest"
+	"github.com/Neon-Dolls/neondoll/Core/Session"
 	"github.com/Neon-Dolls/neondoll/Core/SessionEvent"
 	"github.com/Neon-Dolls/neondoll/DollLink/Events"
 	"github.com/dividebyzero/neondoll-gateway-telegram/contract"
@@ -37,6 +38,11 @@ type Runtime interface {
 	Shutdown() error
 }
 
+type routingIngress interface {
+	ResolvePlatformSession(context.Context, string) (session.ID, error)
+	ExternalConversationRef(context.Context, session.ID) (string, error)
+}
+
 type Config struct {
 	InstanceID externalidentity.GatewayInstanceID
 	DollID     string
@@ -50,6 +56,7 @@ type Adapter struct {
 
 	mu         sync.Mutex
 	ingress    gateway.Ingress
+	routes     routingIngress
 	cancel     context.CancelFunc
 	done       chan struct{}
 	started    bool
@@ -81,6 +88,10 @@ func (a *Adapter) Start(ctx context.Context, ingress gateway.Ingress) error {
 	if ingress == nil {
 		return gateway.ErrInvalidAdapter
 	}
+	routes, ok := ingress.(routingIngress)
+	if !ok {
+		return gateway.ErrHostNotConfigured
+	}
 	a.mu.Lock()
 	if a.started || a.stopped {
 		a.mu.Unlock()
@@ -88,6 +99,7 @@ func (a *Adapter) Start(ctx context.Context, ingress gateway.Ingress) error {
 	}
 	a.started = true
 	a.ingress = ingress
+	a.routes = routes
 	a.mu.Unlock()
 	if err := a.config.Runtime.Start(a.config.WASM); err != nil {
 		return err
@@ -154,11 +166,11 @@ func (a *Adapter) handleOutgoing(ctx context.Context, message contract.GatewayMe
 	conversation := conversationPrefix + strconv.FormatInt(incoming.ChatID, 10)
 	sender := gateway.VerifiedSender{Platform: Platform, SubjectID: strconv.FormatInt(incoming.SenderID, 10)}
 	if decision, requestID, ok := parseDecision(incoming.Text); ok {
-		route, err := a.ingress.ResolvePlatformSession(ctx, conversation)
+		sessionID, err := a.routes.ResolvePlatformSession(ctx, conversation)
 		if err != nil {
 			return err
 		}
-		event, err := sessionevent.NewEvent(route.SessionID, sessionevent.TypePermissionDecided,
+		event, err := sessionevent.NewEvent(sessionID, sessionevent.TypePermissionDecided,
 			sessionevent.PermissionDecidedPayload{RequestID: requestID, Decision: decision},
 			sessionevent.Correlation{RequestID: requestID}, time.Now())
 		if err != nil {
@@ -225,11 +237,11 @@ func (a *Adapter) Deliver(ctx context.Context, envelope gateway.OutboundEnvelope
 }
 
 func (a *Adapter) deliver(ctx context.Context, envelope gateway.OutboundEnvelope, delivery sessionevent.Delivery) error {
-	route, err := a.ingress.SessionRoute(ctx, delivery.Event.SessionID)
+	conversation, err := a.routes.ExternalConversationRef(ctx, delivery.Event.SessionID)
 	if err != nil {
 		return err
 	}
-	chatID, err := parseConversation(route.ExternalConversationRef)
+	chatID, err := parseConversation(conversation)
 	if err != nil {
 		return sessionevent.TerminalDeliveryError(err)
 	}
