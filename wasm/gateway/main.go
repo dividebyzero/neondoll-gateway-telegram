@@ -145,6 +145,8 @@ var (
 	pollTimeout    int
 	allowedUpdates []string
 	telegramHost   string
+	outboundChatID int64
+	outboundID     string
 )
 
 // ── JSON array URL encoding ───────────────────────────────────────────────
@@ -337,11 +339,135 @@ func gatewayHandleEvent(ptr uint32, size uint32) int32 {
 		emitOutgoing([]byte("token:" + tok))
 	case "http_request":
 		handleHTTPRequest(string(ev.Payload))
+	case "session.route":
+		var route struct {
+			ChatID     int64  `json:"chat_id"`
+			DeliveryID string `json:"delivery_id"`
+		}
+		if json.Unmarshal(ev.Payload, &route) != nil || route.ChatID == 0 {
+			emitLog("session.route: invalid payload")
+			return 0
+		}
+		outboundChatID, outboundID = route.ChatID, route.DeliveryID
+	case "session.event":
+		handleSessionEvent(ev.Payload)
 	default:
 		emitLog("gateway_event: unknown event type " + ev.Type)
 	}
 
 	return 0
+}
+
+func handleSessionEvent(payload json.RawMessage) {
+	text := ""
+	deliveryID := outboundID
+	var delivery struct {
+		DeliveryID string `json:"delivery_id"`
+		Event      struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		} `json:"event"`
+	}
+	if json.Unmarshal(payload, &delivery) == nil && delivery.Event.Type != "" {
+		if delivery.DeliveryID != "" {
+			deliveryID = delivery.DeliveryID
+		}
+		switch delivery.Event.Type {
+		case "message":
+			var message struct {
+				Parts []struct{ Type, Text string } `json:"parts"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &message) == nil {
+				var parts []string
+				for _, part := range message.Parts {
+					if part.Type == "text" && part.Text != "" {
+						parts = append(parts, part.Text)
+					}
+				}
+				text = strings.Join(parts, "\n")
+			}
+		case "permission.requested":
+			var request struct {
+				RequestID string `json:"request_id"`
+				Question  string `json:"question"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &request) == nil {
+				text = request.Question + "\n\nReply /approve " + request.RequestID + " or /deny " + request.RequestID
+			}
+		case "status", "error":
+			var status struct {
+				Status  string `json:"status"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &status) == nil {
+				text = status.Message
+				if text == "" {
+					text = status.Status
+				}
+			}
+		}
+	} else {
+		var legacy struct {
+			Text string `json:"text"`
+		}
+		_ = json.Unmarshal(payload, &legacy)
+		text = legacy.Text
+	}
+	if outboundChatID == 0 || text == "" {
+		emitDeliveryResult(deliveryID, false, "unsupported session event")
+		return
+	}
+	ok := sendTelegramText(outboundChatID, text)
+	emitDeliveryResult(deliveryID, ok, "telegram sendMessage failed")
+}
+
+func sendTelegramText(chatID int64, text string) bool {
+	if token == "" {
+		return false
+	}
+	base := telegramHost
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	requestURL := base + "/bot" + token + "/sendMessage?chat_id=" + strconv.FormatInt(chatID, 10) + "&text=" + queryEscape(text)
+	var result [12]byte
+	hostHTTPGet(uint32(uintptr(unsafe.Pointer(unsafe.StringData(requestURL)))), uint32(len(requestURL)),
+		uint32(uintptr(unsafe.Pointer(&responseBuf[0]))), uint32(len(responseBuf)), uint32(uintptr(unsafe.Pointer(&result[0]))))
+	code := uint32(result[4]) | uint32(result[5])<<8 | uint32(result[6])<<16 | uint32(result[7])<<24
+	return code == 0
+}
+
+func emitDeliveryResult(deliveryID string, ok bool, message string) {
+	result := struct {
+		EventType  string `json:"event_type"`
+		DeliveryID string `json:"delivery_id,omitempty"`
+		OK         bool   `json:"ok"`
+		Error      string `json:"error,omitempty"`
+	}{
+		EventType: "delivery.result", DeliveryID: deliveryID, OK: ok,
+	}
+	if !ok {
+		result.Error = message
+	}
+	data, _ := json.Marshal(result)
+	emitOutgoing(data)
+}
+
+func queryEscape(value string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-_.~", rune(c)) {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+		}
+	}
+	return b.String()
 }
 
 func handleHTTPRequest(payload string) {

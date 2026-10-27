@@ -682,6 +682,17 @@ func (r *GatewayRuntime) appendOutbound(msg contract.GatewayMessage) {
 	r.Outbound = append(r.Outbound, msg)
 }
 
+// TakeOutbound atomically returns and clears guest-emitted messages. Runtime
+// adapters use this after a guest call returns so Core callbacks never run
+// reentrantly inside Wazero.
+func (r *GatewayRuntime) TakeOutbound() []contract.GatewayMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := append([]contract.GatewayMessage(nil), r.Outbound...)
+	r.Outbound = nil
+	return result
+}
+
 // config returns the configured GatewayConfig, or nil when unconfigured.
 func (r *GatewayRuntime) config() *contract.GatewayConfig {
 	r.mu.Lock()

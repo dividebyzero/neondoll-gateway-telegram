@@ -6,7 +6,6 @@ package host
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -483,8 +482,4 @@ func TestTelegramPollAllowedUpdates(t *testing.T) {
 	if !strings.Contains(seenUpdates, "message") {
 		t.Fatalf("allowed_updates=%q does not contain 'message'", seenUpdates)
 	}
-}
-
-func ExampleLoadWASM(t *testing.T) {
-	fmt.Println("loadWASMWhiteBox loads the .wasm file from disk")
 }
