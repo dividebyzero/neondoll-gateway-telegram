@@ -1,257 +1,433 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// wasm/gateway — Minimal Gateway module compiled via TinyGo to wasm.
-// Imports host functions from "gateway_host" and exports lifecycle.
-// Independently buildable:
-//   tinygo build -target=wasi -o ../build/gateway.wasm .
+// WASM gateway for neondoll Telegram polling (ABI v2).
 //
-// ABI v2: guest-owned buffers exported via accessor functions.
-// The host queries gateway_event_buf / gateway_event_buf_size after
-// instantiation — no hardcoded offsets.
-
+// Implements the host-mediated Telegram getUpdates polling loop, converting
+// incoming text messages into gateway events. Operates within the host's
+// lifecycle: gateway_init → (getUpdates loop via gateway_poll) → shutdown.
 package main
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 	"unsafe"
 )
 
-// ═══════════════════════════════════════════════════════════════════════
-// ABI — guest-owned buffer exports
-// ═══════════════════════════════════════════════════════════════════════
-// The host NEVER hardcodes memory offsets.  After instantiation it calls
-// gateway_event_buf to learn the address of the guest's static buffer.
+// TinyGo WASI needs a main() to compile the module.
 
-const eventBufSize = 4096
-const respBufSize = 4096
+func main() {}
 
-// eventBuf is a static, zero-initialised array in the guest's data section.
-// The host writes inbound event payloads here before calling
-// gateway_handle_event.
-var eventBuf [eventBufSize]byte
-
-// respBuf is used for HTTP response bodies.  The guest passes its address
-// directly to hostHTTPGet so it is implicitly guest-owned.
-var respBuf [respBufSize]byte
-
-// cfgBuf is a guest-owned scratch buffer for the config projection and
-// credential capability probes.
-var cfgBuf [1024]byte
-
-//export gateway_event_buf
-func gateway_event_buf() uint32 { return uint32(uintptr(unsafe.Pointer(&eventBuf[0]))) }
-
-//export gateway_event_buf_size
-func gateway_event_buf_size() uint32 { return eventBufSize }
-
-//export gateway_abi_version
-func gateway_abi_version() int32 { return 2 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Host capability imports
-// ═══════════════════════════════════════════════════════════════════════
-
-//go:wasmimport gateway_host log
-func hostLog(ptr uint32, len uint32)
-
-//go:wasmimport gateway_host http_get
-func hostHTTPGet(urlPtr uint32, urlLen uint32, respBuf uint32, respMax uint32, resultPtr uint32)
+// ── Host imports ──────────────────────────────────────────────────────────
 
 //go:wasmimport gateway_host outgoing
-func hostOutgoing(ptr uint32, len uint32)
+func hostOutgoing(ptr, size uint32)
 
-// hostConfigProjection copies the redacted config projection JSON into
-// the guest buffer at ptr (max maxLen bytes).  Returns bytes written
-// (0 when unconfigured).
-//
+//go:wasmimport gateway_host http_get
+func hostHTTPGet(urlPtr, urlLen, respBuf, respMax, resultPtr uint32)
+
 //go:wasmimport gateway_host config_projection
-func hostConfigProjection(ptr uint32, maxLen uint32) int32
+func hostConfigProjection(ptr, maxLen uint32) int32
 
-// hostTelegramToken is the mediated credential capability: it copies the
-// host-owned bot token into the guest buffer at ptr (max maxLen bytes).
-// Returns bytes written (0 when unconfigured).  The token is host-owned
-// and never part of the config projection.
-//
 //go:wasmimport gateway_host telegram_token
-func hostTelegramToken(ptr uint32, maxLen uint32) int32
+func hostTelegramToken(ptr, maxLen uint32) int32
 
-// ═══════════════════════════════════════════════════════════════════════
-// Guest exports  —  lifecycle
-// ═══════════════════════════════════════════════════════════════════════
+//go:wasmimport gateway_host log
+func hostEmitLog(ptr, size uint32)
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+var logBuf [256]byte
+
+var configBuf [1024]byte
+
+func emitLog(msg string) {
+	src := unsafe.StringData(msg)
+	hostEmitLog(uint32(uintptr(unsafe.Pointer(src))), uint32(len(msg)))
+}
+
+func emitOutgoing(data []byte) {
+	hostOutgoing(uint32(uintptr(unsafe.Pointer(unsafe.SliceData(data)))), uint32(len(data)))
+}
+
+func readConfig() (cfg string, ok bool) {
+	n := hostConfigProjection(uint32(uintptr(unsafe.Pointer(&configBuf[0]))), 1024)
+	if n <= 0 {
+		return "", false
+	}
+	cfg = string(append([]byte(nil), configBuf[:n]...))
+	return cfg, true
+}
+
+func readToken() (tok string, ok bool) {
+	n := hostTelegramToken(uint32(uintptr(unsafe.Pointer(&logBuf[0]))), 256)
+	if n <= 0 {
+		return "", false
+	}
+	tok = string(append([]byte(nil), logBuf[:n]...))
+	return tok, true
+}
+
+// ── Event buffer ───────────────────────────────────────────────────────────
+
+var eventBuffer [4096]byte
+
+//export gateway_event_buf
+func gateway_event_buf() uint32 {
+	return uint32(uintptr(unsafe.Pointer(&eventBuffer)))
+}
+
+//export gateway_event_buf_size
+func gateway_event_buf_size() uint32 {
+	return 4096
+}
+
+//export gateway_abi_version
+func gateway_abi_version() int32 {
+	return 2
+}
+
+// ── Exports ───────────────────────────────────────────────────────────────
 
 //export gateway_init
-func gateway_init() int32 {
-	emitLog("gateway_init: module ready (abi 2, guest-owned buffers)")
+func gatewayInit() int32 {
+	cfg, haveCfg := readConfig()
 
-	// Fetch the redacted config projection via the mediated import.
-	// hostConfigProjection returns 0 when the runtime is unconfigured.
-	n := hostConfigProjection(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
-	if n > 0 {
-		emitLog("gateway_init: config projection ok (len=" + itoa(uint32(n)) + ")")
-	} else {
-		emitLog("gateway_init: no config projection")
+	if !haveCfg {
+		emitLog("no config projection")
+	}
+	tok, haveTok := readToken()
+	if !haveTok {
+		emitLog("no telegram token")
+	}
+	if haveCfg {
+		emitLog("gateway_init: config projection ok")
+	}
+	if haveTok {
+		emitLog("telegram token capability ready")
 	}
 
-	// Probe the credential capability WITHOUT logging the token itself.
-	// Only presence is reported; the secret stays host-owned.
-	n = hostTelegramToken(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
-	if n > 0 {
-		emitLog("gateway_init: telegram token capability ready (len=" + itoa(uint32(n)) + ")")
-	} else {
-		emitLog("gateway_init: no telegram token")
+	// Parse the config for allowed_updates.
+	if haveCfg {
+		var cfgObj struct {
+			Telegram struct {
+				Host string `json:"host"`
+			} `json:"telegram"`
+			Polling struct {
+				TimeoutSeconds int      `json:"timeout_seconds"`
+				AllowedUpdates []string `json:"allowed_updates"`
+			} `json:"polling"`
+		}
+		if err := json.Unmarshal([]byte(cfg), &cfgObj); err == nil {
+			if cfgObj.Telegram.Host != "" {
+				telegramHost = cfgObj.Telegram.Host
+			}
+			pollTimeout = cfgObj.Polling.TimeoutSeconds
+			if pollTimeout <= 0 {
+				pollTimeout = 25
+			}
+			allowedUpdates = cfgObj.Polling.AllowedUpdates
+		}
+	}
+
+	// Read token into global
+	if haveTok {
+		token = tok
 	}
 	return 0
 }
 
-// gateway_handle_event receives an inbound event written by the host into
-// the guest-owned event buffer.  The guest reads the payload and may
-// call host functions or emit outgoing messages in response.
-//
-// Expected payload types (M2.1 feasibility):
-//
-//	ping         –  emits a deterministic pong outbound
-//	http_request –  calls hostHTTPGet, emits an http_result outbound
-//
-//export gateway_handle_event
-func gateway_handle_event(ptr uint32, size uint32) int32 {
-	payload := readString(ptr, size)
+// ── State ─────────────────────────────────────────────────────────────────
 
-	switch {
-	case strings.Contains(payload, `"type":"ping"`):
-		msg := `{"type":"pong","echo":"ping"}`
-		hostOutgoing(stringPtr(msg), uint32(len(msg)))
-		return 0
+var (
+	token          string
+	offset         int64
+	pollTimeout    int
+	allowedUpdates []string
+	telegramHost   string
+)
 
-	case strings.Contains(payload, `"type":"http_request"`):
-		url := extractURL(payload)
-		if url == "" {
-			emitLog("handle_event: http_request with no url")
-			return 0
-		}
-		var result [12]byte // [written:4][err:4][status:4]
-		hostHTTPGet(
-			stringPtr(url), uint32(len(url)),
-			uint32(uintptr(unsafe.Pointer(&respBuf[0]))), respBufSize,
-			uint32(uintptr(unsafe.Pointer(&result[0]))),
-		)
-		written := le32(result[0:4])
-		err := le32(result[4:8])
-		status := le32(result[8:12])
+// ── JSON array URL encoding ───────────────────────────────────────────────
 
-		// Build a deterministic result message.
-		msg := `{"type":"http_result","err":` + itoa(err) +
-			`,"status":` + itoa(status) +
-			`,"len":` + itoa(written)
-		if err == 0 && written > 0 {
-			headN := written
-			if headN > 64 {
-				headN = 64
-			}
-			raw := string(respBuf[:headN])
-			msg += `,"head":"` + escStr(raw) + `"`
-		}
-		msg += `}`
-		hostOutgoing(stringPtr(msg), uint32(len(msg)))
-		return 0
-
-	// Token capability probe: requests the host-owned credential and
-	// echoes it verbatim.  The host MUST redact the secret before any
-	// log or outbound record leaves the boundary — this event proves
-	// both the mediated capability and host-side secret redaction.
-	case strings.Contains(payload, `"type":"echo_token"`):
-		n := hostTelegramToken(uint32(uintptr(unsafe.Pointer(&cfgBuf[0]))), uint32(len(cfgBuf)))
-		if n <= 0 {
-			emitLog("handle_event: echo_token with no token available")
-			return 0
-		}
-		tok := string(cfgBuf[:n])
-		msg := `{"type":"token_echo","token":"` + escStr(tok) + `"}`
-		hostOutgoing(stringPtr(msg), uint32(len(msg)))
-		return 0
-
-	default:
-		emitLog("handle_event: unknown type (len=" + itoa(size) + ")")
-		return 0
+// encodeJSONArray encodes a Go string slice as a URL-escaped JSON array,
+// for use in query parameters. Produces e.g. %5B%22message%22%5D for
+// ["message"].
+func encodeJSONArray(elems []string) string {
+	if len(elems) == 0 {
+		return ""
 	}
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteString("%5B") // [
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteString("%2C") // ,
+		}
+		b.WriteString("%22") // "
+		// Basic char-by-char encoding; Telegram update types are ASCII.
+		for _, r := range e {
+			switch {
+			case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_':
+				b.WriteByte(byte(r))
+			default:
+				// URL-encode any non-ASCII-alphanumeric char.
+				b.WriteString("%" + strconv.FormatUint(uint64(r), 16))
+			}
+		}
+		b.WriteString("%22") // "
+	}
+	b.WriteString("%5D") // ]
+	return b.String()
 }
+
+// ── Polling ───────────────────────────────────────────────────────────────
 
 //export gateway_poll
-func gateway_poll() int32 {
-	msg := `{"type":"poll_tick"}`
-	hostOutgoing(stringPtr(msg), uint32(len(msg)))
-	return 0
-}
-
-//export gateway_shutdown
-func gateway_shutdown() int32 {
-	emitLog("gateway_shutdown: clean exit")
-	return 0
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════════════
-
-// readString zero-copy reads len bytes starting at ptr in linear memory
-// into a Go string.  The host has already written the event there.
-func readString(ptr uint32, size uint32) string {
-	if size == 0 {
-		return ""
-	}
-	return unsafe.String((*byte)(unsafe.Pointer(uintptr(ptr))), size)
-}
-
-// extractURL finds the first "url":"<value>" in a JSON payload and
-// returns <value>.  Returns "" when not found.
-func extractURL(payload string) string {
-	marker := `"url":"`
-	idx := strings.Index(payload, marker)
-	if idx < 0 {
-		return ""
-	}
-	rest := payload[idx+len(marker):]
-	end := strings.IndexByte(rest, '"')
-	if end < 0 {
-		return rest
-	}
-	return rest[:end]
-}
-
-// le32 reads a little-endian uint32 from the first 4 bytes of b.
-func le32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-// stringPtr returns the linear-memory address of the backing data of s.
-func stringPtr(s string) uint32 {
-	if len(s) == 0 {
+func gatewayPoll() int32 {
+	if token == "" {
+		emitLog("gateway_poll: no token configured")
 		return 0
 	}
-	return uint32(uintptr(unsafe.Pointer(unsafe.StringData(s))))
+
+	// Build the URL.
+	base := telegramHost
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	url := base + "/bot" + token + "/getUpdates?timeout=" + strconv.Itoa(pollTimeout)
+	if offset > 0 {
+		url += "&offset=" + strconv.FormatInt(offset, 10)
+	}
+	if encoded := encodeJSONArray(allowedUpdates); encoded != "" {
+		url += "&allowed_updates=" + encoded
+	}
+
+	emitLog("gateway_poll: getUpdates")
+
+	// HTTP GET via host import. 4 KB response buffer.
+	var result [12]byte // [written:4][err:4][status:4]
+	hostHTTPGet(
+		uint32(uintptr(unsafe.Pointer(unsafe.StringData(url)))),
+		uint32(len(url)),
+		uint32(uintptr(unsafe.Pointer(&responseBuf[0]))),
+		uint32(len(responseBuf)),
+		uint32(uintptr(unsafe.Pointer(&result[0]))),
+	)
+
+	// Parse the result header.
+	written := uint32(result[0]) | uint32(result[1])<<8 | uint32(result[2])<<16 | uint32(result[3])<<24
+	code := uint32(result[4]) | uint32(result[5])<<8 | uint32(result[6])<<16 | uint32(result[7])<<24
+	status := uint32(result[8]) | uint32(result[9])<<8 | uint32(result[10])<<16 | uint32(result[11])<<24
+
+	if code != 0 {
+		emitLog("gateway_poll: HTTP error code=" + itoa(int(code)) + " status=" + itoa(int(status)))
+		return 0
+	}
+
+	body := responseBuf[:written]
+	emitLog("gateway_poll: got " + itoa(int(written)) + " bytes")
+
+	// Parse Telegram response.
+	var tgResp struct {
+		Ok     bool `json:"ok"`
+		Result []struct {
+			UpdateID int64 `json:"update_id"`
+			Message  *struct {
+				MessageID int64 `json:"message_id"`
+				From      *struct {
+					ID        int64  `json:"id"`
+					FirstName string `json:"first_name"`
+				} `json:"from"`
+				Chat struct {
+					ID   int64  `json:"id"`
+					Type string `json:"type"`
+				} `json:"chat"`
+				Date int64  `json:"date"`
+				Text string `json:"text"`
+			} `json:"message"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &tgResp); err != nil {
+		emitLog("gateway_poll: json error: " + err.Error())
+		return 0
+	}
+	if !tgResp.Ok {
+		emitLog("gateway_poll: telegram returned not ok")
+		return 0
+	}
+	for _, u := range tgResp.Result {
+		if u.UpdateID < offset {
+			continue
+		}
+		offset = u.UpdateID + 1
+		if u.Message == nil || u.Message.Text == "" {
+			continue
+		}
+		// Emit a gateway event in GatewayEventEnvelope format.
+		evt := struct {
+			EventVersion int    `json:"event_version"`
+			EventType    string `json:"event_type"`
+			Source       string `json:"source"`
+			UpdateID     int64  `json:"update_id"`
+			MessageID    int64  `json:"message_id"`
+			ChatID       int64  `json:"chat_id"`
+			ChatType     string `json:"chat_type"`
+			SenderID     int64  `json:"sender_id,omitempty"`
+			SenderName   string `json:"sender_name,omitempty"`
+			Text         string `json:"text"`
+			ReceivedAt   int64  `json:"received_at"`
+		}{
+			EventVersion: 1,
+			EventType:    "message.incoming",
+			Source:       "telegram",
+			UpdateID:     u.UpdateID,
+			MessageID:    u.Message.MessageID,
+			ChatID:       u.Message.Chat.ID,
+			ChatType:     u.Message.Chat.Type,
+			Text:         u.Message.Text,
+			ReceivedAt:   u.Message.Date,
+		}
+		if u.Message.From != nil {
+			evt.SenderID = u.Message.From.ID
+			evt.SenderName = u.Message.From.FirstName
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			emitLog("gateway_poll: marshal event: " + err.Error())
+			continue
+		}
+		emitOutgoing(data)
+	}
+
+	return 0
 }
 
-// escStr escapes \ and " so the string can be embedded inside a JSON value.
-func escStr(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return s
+var responseBuf [4096]byte
+
+// ── Event handler ─────────────────────────────────────────────────────────
+
+//export gateway_handle_event
+func gatewayHandleEvent(ptr uint32, size uint32) int32 {
+	if size == 0 || size > 4096 {
+		emitLog("gateway_handle_event: bad size")
+		return 0
+	}
+
+	eventData := string(append([]byte(nil), rawMem(ptr, size)...))
+
+	var ev struct {
+		V       int             `json:"v"`
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal([]byte(eventData), &ev); err != nil {
+		emitLog("gateway_handle_event: json error: " + err.Error())
+		return 0
+	}
+
+	switch ev.Type {
+	case "ping":
+		emitOutgoing([]byte(`{"type":"pong","echo":"ping"}`))
+	case "echo_token":
+		tok, ok := readToken()
+		if !ok {
+			emitLog("echo_token with no token available")
+			return 0
+		}
+		emitOutgoing([]byte("token:" + tok))
+	case "http_request":
+		handleHTTPRequest(string(ev.Payload))
+	default:
+		emitLog("gateway_event: unknown event type " + ev.Type)
+	}
+
+	return 0
 }
 
-// itoa formats n as a decimal string (no leading zeros; 0 → "0").
-func itoa(n uint32) string {
-	if n == 0 {
+func handleHTTPRequest(payload string) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		emitLog("http_request: invalid payload: " + err.Error())
+		return
+	}
+
+	var result [12]byte
+	hostHTTPGet(
+		uint32(uintptr(unsafe.Pointer(unsafe.StringData(req.URL)))),
+		uint32(len(req.URL)),
+		uint32(uintptr(unsafe.Pointer(&responseBuf[0]))),
+		uint32(len(responseBuf)),
+		uint32(uintptr(unsafe.Pointer(&result[0]))),
+	)
+
+	written := uint32(result[0]) | uint32(result[1])<<8 | uint32(result[2])<<16 | uint32(result[3])<<24
+	code := uint32(result[4]) | uint32(result[5])<<8 | uint32(result[6])<<16 | uint32(result[7])<<24
+	httpStatus := uint32(result[8]) | uint32(result[9])<<8 | uint32(result[10])<<16 | uint32(result[11])<<24
+
+	body := ""
+	if written > 0 {
+		n := int(written)
+		if n > 128 {
+			n = 128
+		}
+		body = string(responseBuf[:n])
+	}
+
+	httpResult := struct {
+		Type   string `json:"type"`
+		Err    int    `json:"err"`
+		Status int    `json:"status"`
+		Len    int    `json:"len"`
+		Head   string `json:"head,omitempty"`
+	}{
+		Type:   "http_result",
+		Err:    int(code),
+		Status: int(httpStatus),
+		Len:    int(written),
+		Head:   body,
+	}
+
+	data, err := json.Marshal(httpResult)
+	if err != nil {
+		emitLog("http_request: marshal error: " + err.Error())
+		return
+	}
+	emitOutgoing(data)
+}
+
+// ── Memory helpers ────────────────────────────────────────────────────────
+
+// rawMem returns a read-only slice of the guest's linear memory at ptr for
+// size bytes. This is safe because we never write beyond the bounds and
+// TinyGo's linear memory is contiguous.
+func rawMem(ptr, size uint32) []byte {
+	if size == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ptr))), size)
+}
+
+// itoa converts an int to ASCII without importing fmt (smaller WASM).
+func itoa(v int) string {
+	if v == 0 {
 		return "0"
 	}
-	var buf [12]byte
+	u := v
+	if u < 0 {
+		u = -u
+	}
+	var buf [20]byte
 	i := len(buf)
-	for n > 0 {
+	for u > 0 {
 		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+		buf[i] = byte('0' + u%10)
+		u /= 10
+	}
+	if v < 0 {
+		i--
+		buf[i] = '-'
 	}
 	return string(buf[i:])
 }
-
-func emitLog(msg string) { hostLog(stringPtr(msg), uint32(len(msg))) }
-
-func main() {}
