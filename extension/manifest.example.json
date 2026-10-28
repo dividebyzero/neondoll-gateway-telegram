@@ -7,7 +7,7 @@
   "enabled": true,
   "artifact": {
     "path": "extensions/telegram/gateway.wasm",
-    "sha256": "983db43203c81c259d87813dd3e3ef6ba529abf23a1e3ebe0bfe85e4e9c87fcc"
+    "sha256": "840cc6a460acf9b86344fad30b8132dd4009864654c7b0e1ddf857b0810c4025"
   },
   "configuration": {
     "version": 1,

@@ -542,6 +542,7 @@ func gatewayPoll() int32 {
 		return 0
 	}
 	changed := false
+	capacityFailure := false
 	for _, u := range tgResp.Result {
 		if u.UpdateID < offset || u.UpdateID < 0 {
 			if u.UpdateID < 0 {
@@ -556,6 +557,7 @@ func gatewayPoll() int32 {
 		if u.Message == nil {
 			emitLog("gateway_poll: unsupported update type")
 			if !appendSkipped(u.UpdateID, "unsupported_update_type") {
+				capacityFailure = true
 				break
 			}
 			changed = true
@@ -564,6 +566,7 @@ func gatewayPoll() int32 {
 		if u.Message.MessageID <= 0 || u.Message.Chat.ID == 0 || u.Message.From == nil || u.Message.From.ID <= 0 || u.Message.From.IsBot {
 			emitLog("gateway_poll: unsupported message sender")
 			if !appendSkipped(u.UpdateID, "invalid_sender") {
+				capacityFailure = true
 				break
 			}
 			changed = true
@@ -577,14 +580,16 @@ func gatewayPoll() int32 {
 		if text == "" && len(media) == 0 {
 			emitLog("gateway_poll: unsupported message content")
 			if !appendSkipped(u.UpdateID, "unsupported_message_content") {
+				capacityFailure = true
 				break
 			}
 			changed = true
 			continue
 		}
 		if len(text) > maxTelegramTextBytes {
-			emitLog("gateway_poll: text exceeds Telegram safety limit")
-			if !appendSkipped(u.UpdateID, "text_exceeds_safety_limit") {
+			emitLog("gateway_poll: provider text exceeds Telegram limit")
+			if !appendSkipped(u.UpdateID, "provider_text_exceeds_telegram_limit") {
+				capacityFailure = true
 				break
 			}
 			changed = true
@@ -623,18 +628,17 @@ func gatewayPoll() int32 {
 		data, err := json.Marshal(evt)
 		if err != nil {
 			emitLog("gateway_poll: marshal event: " + err.Error())
-			continue
+			capacityFailure = true
+			break
 		}
 		if len(data) > maxGatewayEventBytes {
-			emitLog("gateway_poll: event exceeds Gateway safety limit")
-			if !appendSkipped(u.UpdateID, "event_exceeds_safety_limit") {
-				break
-			}
-			changed = true
-			continue
+			emitLog("gateway_poll: valid event exceeds transport capacity; retrying")
+			capacityFailure = true
+			break
 		}
 		pending.Event = data
 		if !appendPending(pending) {
+			capacityFailure = true
 			break
 		}
 		changed = true
@@ -646,6 +650,10 @@ func gatewayPoll() int32 {
 		return 1
 	}
 	emitPending()
+	if capacityFailure {
+		emitLog("gateway_poll: internal capacity backpressure")
+		return 1
+	}
 
 	return 0
 }

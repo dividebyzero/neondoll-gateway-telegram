@@ -57,9 +57,11 @@ maximum, multibyte UTF-8, and JSON escaping. Limits are measured in serialized
 bytes: text has a 16 KiB safety bound, the complete event a 64 KiB bound, and
 the mediated Bot API response a 4 MiB bound. A deliberately unsupported update
 is advanced only through a durable skip record with a diagnostic reason; queue
-capacity never causes a skip. Missing, invalid, or bot sender identities are
-not emitted as user messages. Core remains the final identity and permission
-authority.
+capacity never causes a skip. A valid message that cannot fit an internal event
+or persistence bound remains unacknowledged, reports explicit capacity
+backpressure, and is retried after restart or when capacity becomes available.
+Missing, invalid, or bot sender identities are not emitted as user messages.
+Core remains the final identity and permission authority.
 
 Image, document, audio, voice, and video messages emit small `media` references
 containing provider file IDs and metadata. Binary content is never embedded or
