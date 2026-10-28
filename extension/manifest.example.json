@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "extension_id": "telegram",
+  "instance_id": "telegram-main",
+  "contract": "gateway",
+  "abi_version": 2,
+  "enabled": true,
+  "artifact": {
+    "path": "extensions/telegram/gateway.wasm",
+    "sha256": "840cc6a460acf9b86344fad30b8132dd4009864654c7b0e1ddf857b0810c4025"
+  },
+  "configuration": {
+    "version": 1,
+    "telegram": {
+      "host": "https://api.telegram.org"
+    },
+    "polling": {
+      "timeout_seconds": 25,
+      "allowed_updates": ["message"]
+    }
+  },
+  "requested_capabilities": ["http", "secrets", "state", "log"],
+  "granted_capabilities": ["http", "secrets", "state", "log"],
+  "http_allowlist": ["api.telegram.org"],
+  "secrets": {
+    "telegram_token": "telegram-main.token"
+  },
+  "gateway": {
+    "platform": "telegram",
+    "doll_id": "default",
+    "conversation_prefix": "telegram/chat/"
+  }
+}

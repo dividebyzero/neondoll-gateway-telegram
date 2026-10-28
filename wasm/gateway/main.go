@@ -35,6 +35,12 @@ func hostTelegramToken(ptr, maxLen uint32) int32
 //go:wasmimport gateway_host log
 func hostEmitLog(ptr, size uint32)
 
+//go:wasmimport gateway_host state_get
+func hostStateGet(keyPtr, keyLen, valuePtr, valueMax uint32) int32
+
+//go:wasmimport gateway_host state_put
+func hostStatePut(keyPtr, keyLen, valuePtr, valueLen uint32) int32
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 var logBuf [256]byte
@@ -70,7 +76,7 @@ func readToken() (tok string, ok bool) {
 
 // ── Event buffer ───────────────────────────────────────────────────────────
 
-var eventBuffer [4096]byte
+var eventBuffer [maxGatewayEventBytes]byte
 
 //export gateway_event_buf
 func gateway_event_buf() uint32 {
@@ -79,7 +85,7 @@ func gateway_event_buf() uint32 {
 
 //export gateway_event_buf_size
 func gateway_event_buf_size() uint32 {
-	return 4096
+	return uint32(len(eventBuffer))
 }
 
 //export gateway_abi_version
@@ -134,6 +140,10 @@ func gatewayInit() int32 {
 	if haveTok {
 		token = tok
 	}
+	if !loadDurableState() {
+		emitLog("gateway_init: durable state capability unavailable")
+		panic("durable state capability unavailable")
+	}
 	return 0
 }
 
@@ -145,7 +155,258 @@ var (
 	pollTimeout    int
 	allowedUpdates []string
 	telegramHost   string
+	outboundChatID int64
+	outboundID     string
+	durable        durableState
+	stateReady     bool
 )
+
+const (
+	durableStateKey      = "telegram.gateway.v1"
+	maxPendingUpdates    = 16
+	maxDurableStateBytes = 2 << 20
+	maxGatewayEventBytes = 64 << 10
+	maxTelegramTextBytes = 16 << 10
+	maxDeliveryIDBytes   = 256
+	maxSkippedUpdates    = 64
+	durableStateHeadroom = maxGatewayEventBytes + 1024
+	maxHTTPResponseBytes = 4 << 20
+)
+
+type durableState struct {
+	Offset     int64           `json:"offset,omitempty"`
+	Pending    []pendingUpdate `json:"pending,omitempty"`
+	Deliveries []string        `json:"deliveries,omitempty"`
+	Skipped    []skippedUpdate `json:"skipped,omitempty"`
+}
+
+type pendingUpdate struct {
+	UpdateID   int64           `json:"update_id"`
+	Event      json.RawMessage `json:"event,omitempty"`
+	Acked      bool            `json:"acked,omitempty"`
+	SkipReason string          `json:"skip_reason,omitempty"`
+	Emitted    bool            `json:"-"`
+}
+
+type skippedUpdate struct {
+	UpdateID int64  `json:"update_id"`
+	Reason   string `json:"reason"`
+}
+
+// telegramMedia is the common metadata subset exposed by Telegram's media
+// objects. File bytes remain at Telegram and are never put in Gateway events.
+type telegramMedia struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Filename     string `json:"file_name"`
+	MIMEType     string `json:"mime_type"`
+	FileSize     int64  `json:"file_size"`
+}
+
+type mediaReference struct {
+	Type           string `json:"type"`
+	MediaID        string `json:"media_id"`
+	UniqueID       string `json:"unique_id,omitempty"`
+	Filename       string `json:"filename,omitempty"`
+	MIMEType       string `json:"mime_type,omitempty"`
+	SizeBytes      int64  `json:"size_bytes,omitempty"`
+	Caption        string `json:"caption,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+}
+
+func telegramMediaReferences(messageID, chatID int64, caption string, photos []telegramMedia, document, audio, voice, video *telegramMedia) []mediaReference {
+	refs := make([]mediaReference, 0, 5)
+	if len(photos) > 0 {
+		largest := photos[0]
+		for _, photo := range photos[1:] {
+			if photo.FileSize >= largest.FileSize {
+				largest = photo
+			}
+		}
+		refs = appendMediaReference(refs, "image", largest, messageID, chatID, caption)
+	}
+	refs = appendTelegramMedia(refs, "file", document, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "audio", audio, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "audio", voice, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "video", video, messageID, chatID, caption)
+	return refs
+}
+
+func appendTelegramMedia(refs []mediaReference, mediaType string, media *telegramMedia, messageID, chatID int64, caption string) []mediaReference {
+	if media == nil {
+		return refs
+	}
+	return appendMediaReference(refs, mediaType, *media, messageID, chatID, caption)
+}
+
+func appendMediaReference(refs []mediaReference, mediaType string, media telegramMedia, messageID, chatID int64, caption string) []mediaReference {
+	if media.FileID == "" {
+		return refs
+	}
+	return append(refs, mediaReference{
+		Type: mediaType, MediaID: media.FileID, UniqueID: media.FileUniqueID,
+		Filename: media.Filename, MIMEType: media.MIMEType, SizeBytes: media.FileSize,
+		Caption: caption, MessageID: strconv.FormatInt(messageID, 10), ConversationID: strconv.FormatInt(chatID, 10),
+	})
+}
+
+var durableStateBuf [maxDurableStateBytes]byte
+
+func loadDurableState() bool {
+	key := []byte(durableStateKey)
+	n := hostStateGet(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&durableStateBuf[0]))), uint32(len(durableStateBuf)))
+	if n >= 0 {
+		if n > maxDurableStateBytes || n > 0 && json.Unmarshal(durableStateBuf[:n], &durable) != nil || !validDurableState() {
+			emitLog("durable state is invalid")
+			return false
+		}
+		offset = durable.Offset
+		stateReady = true
+		return true
+	}
+	// A missing key and a denied capability both return -1 in ABI v2.
+	// Writing the initial state distinguishes a usable empty store from a
+	// missing capability without weakening fail-closed behavior.
+	durable = durableState{}
+	stateReady = persistDurableState()
+	return stateReady
+}
+
+func persistDurableState() bool {
+	durable.Offset = offset
+	data, ok := marshalDurableState()
+	if !ok {
+		return false
+	}
+	key := []byte(durableStateKey)
+	if len(data) == 0 {
+		return false
+	}
+	return hostStatePut(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data))) == 0
+}
+
+func marshalDurableState() ([]byte, bool) {
+	data, err := json.Marshal(durable)
+	return data, err == nil && len(data) <= maxDurableStateBytes
+}
+
+func validDurableState() bool {
+	if len(durable.Pending) > maxPendingUpdates {
+		return false
+	}
+	previous := int64(-1)
+	for _, pending := range durable.Pending {
+		if pending.UpdateID < 0 || pending.UpdateID <= previous || len(pending.Event) > maxGatewayEventBytes || pending.SkipReason != "" && !pending.Acked {
+			return false
+		}
+		previous = pending.UpdateID
+	}
+	for _, deliveryID := range durable.Deliveries {
+		if deliveryID == "" || len(deliveryID) > maxDeliveryIDBytes {
+			return false
+		}
+	}
+	if len(durable.Skipped) > maxSkippedUpdates {
+		return false
+	}
+	for _, skipped := range durable.Skipped {
+		if skipped.UpdateID < 0 || skipped.Reason == "" || len(skipped.Reason) > 128 {
+			return false
+		}
+	}
+	_, ok := marshalDurableState()
+	return ok
+}
+
+func pendingIndex(updateID int64) int {
+	for i := range durable.Pending {
+		if durable.Pending[i].UpdateID == updateID {
+			return i
+		}
+	}
+	return -1
+}
+
+func advanceAcceptedPrefix() {
+	for len(durable.Pending) > 0 && durable.Pending[0].Acked {
+		if durable.Pending[0].SkipReason != "" {
+			durable.Skipped = append(durable.Skipped, skippedUpdate{UpdateID: durable.Pending[0].UpdateID, Reason: durable.Pending[0].SkipReason})
+			if len(durable.Skipped) > maxSkippedUpdates {
+				durable.Skipped = durable.Skipped[len(durable.Skipped)-maxSkippedUpdates:]
+			}
+		}
+		if next := durable.Pending[0].UpdateID + 1; next > offset {
+			offset = next
+		}
+		durable.Pending = durable.Pending[1:]
+	}
+}
+
+func emitPending() {
+	for i := range durable.Pending {
+		pending := &durable.Pending[i]
+		if pending.Acked || pending.Emitted || len(pending.Event) == 0 {
+			continue
+		}
+		emitOutgoing(pending.Event)
+		pending.Emitted = true
+	}
+}
+
+func pendingBackpressure() bool {
+	if len(durable.Pending) >= maxPendingUpdates {
+		return true
+	}
+	data, ok := marshalDurableState()
+	return !ok || len(data) > maxDurableStateBytes-durableStateHeadroom
+}
+
+func acceptInbound(eventID string) {
+	updateID, err := strconv.ParseInt(eventID, 10, 64)
+	if err != nil {
+		emitLog("inbound.accepted: invalid event_id")
+		return
+	}
+	index := pendingIndex(updateID)
+	if index < 0 {
+		if updateID >= offset {
+			emitLog("inbound.accepted: unknown event_id")
+		}
+		return
+	}
+	durable.Pending[index].Acked = true
+	advanceAcceptedPrefix()
+	if !persistDurableState() {
+		stateReady = false
+		emitLog("inbound.accepted: durable state unavailable")
+	}
+}
+
+func appendPending(pending pendingUpdate) bool {
+	if len(durable.Pending) >= maxPendingUpdates {
+		return false
+	}
+	index := len(durable.Pending)
+	for i := range durable.Pending {
+		if pending.UpdateID < durable.Pending[i].UpdateID {
+			index = i
+			break
+		}
+	}
+	durable.Pending = append(durable.Pending, pendingUpdate{})
+	copy(durable.Pending[index+1:], durable.Pending[index:])
+	durable.Pending[index] = pending
+	if _, ok := marshalDurableState(); !ok {
+		durable.Pending = append(durable.Pending[:index], durable.Pending[index+1:]...)
+		return false
+	}
+	return true
+}
+
+func appendSkipped(updateID int64, reason string) bool {
+	return appendPending(pendingUpdate{UpdateID: updateID, Acked: true, SkipReason: reason})
+}
 
 // ── JSON array URL encoding ───────────────────────────────────────────────
 
@@ -184,8 +445,24 @@ func encodeJSONArray(elems []string) string {
 
 //export gateway_poll
 func gatewayPoll() int32 {
+	if !stateReady {
+		emitLog("gateway_poll: durable state unavailable")
+		panic("durable state unavailable")
+	}
 	if token == "" {
 		emitLog("gateway_poll: no token configured")
+		return 0
+	}
+	// Restored, unacknowledged updates are retried before asking Telegram for
+	// newer work. Emitted is intentionally process-local and resets on restart.
+	for i := range durable.Pending {
+		if !durable.Pending[i].Acked && !durable.Pending[i].Emitted {
+			emitPending()
+			return 0
+		}
+	}
+	if pendingBackpressure() {
+		emitLog("gateway_poll: pending queue backpressure")
 		return 0
 	}
 
@@ -198,13 +475,15 @@ func gatewayPoll() int32 {
 	if offset > 0 {
 		url += "&offset=" + strconv.FormatInt(offset, 10)
 	}
+	url += "&limit=" + strconv.Itoa(maxPendingUpdates-len(durable.Pending))
 	if encoded := encodeJSONArray(allowedUpdates); encoded != "" {
 		url += "&allowed_updates=" + encoded
 	}
 
 	emitLog("gateway_poll: getUpdates")
 
-	// HTTP GET via host import. 4 KB response buffer.
+	// HTTP GET via the bounded host capability. The queue-specific Telegram
+	// limit keeps normal responses well below this explicit safety ceiling.
 	var result [12]byte // [written:4][err:4][status:4]
 	hostHTTPGet(
 		uint32(uintptr(unsafe.Pointer(unsafe.StringData(url)))),
@@ -236,14 +515,21 @@ func gatewayPoll() int32 {
 				MessageID int64 `json:"message_id"`
 				From      *struct {
 					ID        int64  `json:"id"`
+					IsBot     bool   `json:"is_bot"`
 					FirstName string `json:"first_name"`
 				} `json:"from"`
 				Chat struct {
 					ID   int64  `json:"id"`
 					Type string `json:"type"`
 				} `json:"chat"`
-				Date int64  `json:"date"`
-				Text string `json:"text"`
+				Date     int64           `json:"date"`
+				Text     string          `json:"text"`
+				Caption  string          `json:"caption"`
+				Photo    []telegramMedia `json:"photo"`
+				Document *telegramMedia  `json:"document"`
+				Audio    *telegramMedia  `json:"audio"`
+				Voice    *telegramMedia  `json:"voice"`
+				Video    *telegramMedia  `json:"video"`
 			} `json:"message"`
 		} `json:"result"`
 	}
@@ -255,27 +541,74 @@ func gatewayPoll() int32 {
 		emitLog("gateway_poll: telegram returned not ok")
 		return 0
 	}
+	changed := false
+	capacityFailure := false
 	for _, u := range tgResp.Result {
-		if u.UpdateID < offset {
+		if u.UpdateID < offset || u.UpdateID < 0 {
+			if u.UpdateID < 0 {
+				emitLog("gateway_poll: unsupported invalid update_id")
+			}
 			continue
 		}
-		offset = u.UpdateID + 1
-		if u.Message == nil || u.Message.Text == "" {
+		if pendingIndex(u.UpdateID) >= 0 {
 			continue
 		}
-		// Emit a gateway event in GatewayEventEnvelope format.
+		pending := pendingUpdate{UpdateID: u.UpdateID}
+		if u.Message == nil {
+			emitLog("gateway_poll: unsupported update type")
+			if !appendSkipped(u.UpdateID, "unsupported_update_type") {
+				capacityFailure = true
+				break
+			}
+			changed = true
+			continue
+		}
+		if u.Message.MessageID <= 0 || u.Message.Chat.ID == 0 || u.Message.From == nil || u.Message.From.ID <= 0 || u.Message.From.IsBot {
+			emitLog("gateway_poll: unsupported message sender")
+			if !appendSkipped(u.UpdateID, "invalid_sender") {
+				capacityFailure = true
+				break
+			}
+			changed = true
+			continue
+		}
+		media := telegramMediaReferences(u.Message.MessageID, u.Message.Chat.ID, u.Message.Caption, u.Message.Photo, u.Message.Document, u.Message.Audio, u.Message.Voice, u.Message.Video)
+		text := u.Message.Text
+		if text == "" {
+			text = u.Message.Caption
+		}
+		if text == "" && len(media) == 0 {
+			emitLog("gateway_poll: unsupported message content")
+			if !appendSkipped(u.UpdateID, "unsupported_message_content") {
+				capacityFailure = true
+				break
+			}
+			changed = true
+			continue
+		}
+		if len(text) > maxTelegramTextBytes {
+			emitLog("gateway_poll: provider text exceeds Telegram limit")
+			if !appendSkipped(u.UpdateID, "provider_text_exceeds_telegram_limit") {
+				capacityFailure = true
+				break
+			}
+			changed = true
+			continue
+		}
+		// Emit a small metadata envelope. Media bytes are never embedded.
 		evt := struct {
-			EventVersion int    `json:"event_version"`
-			EventType    string `json:"event_type"`
-			Source       string `json:"source"`
-			UpdateID     int64  `json:"update_id"`
-			MessageID    int64  `json:"message_id"`
-			ChatID       int64  `json:"chat_id"`
-			ChatType     string `json:"chat_type"`
-			SenderID     int64  `json:"sender_id,omitempty"`
-			SenderName   string `json:"sender_name,omitempty"`
-			Text         string `json:"text"`
-			ReceivedAt   int64  `json:"received_at"`
+			EventVersion int              `json:"event_version"`
+			EventType    string           `json:"event_type"`
+			Source       string           `json:"source"`
+			UpdateID     int64            `json:"update_id"`
+			MessageID    int64            `json:"message_id"`
+			ChatID       int64            `json:"chat_id"`
+			ChatType     string           `json:"chat_type"`
+			SenderID     int64            `json:"sender_id,omitempty"`
+			SenderName   string           `json:"sender_name,omitempty"`
+			Text         string           `json:"text"`
+			Media        []mediaReference `json:"media,omitempty"`
+			ReceivedAt   int64            `json:"received_at"`
 		}{
 			EventVersion: 1,
 			EventType:    "message.incoming",
@@ -284,7 +617,8 @@ func gatewayPoll() int32 {
 			MessageID:    u.Message.MessageID,
 			ChatID:       u.Message.Chat.ID,
 			ChatType:     u.Message.Chat.Type,
-			Text:         u.Message.Text,
+			Text:         text,
+			Media:        media,
 			ReceivedAt:   u.Message.Date,
 		}
 		if u.Message.From != nil {
@@ -294,21 +628,43 @@ func gatewayPoll() int32 {
 		data, err := json.Marshal(evt)
 		if err != nil {
 			emitLog("gateway_poll: marshal event: " + err.Error())
-			continue
+			capacityFailure = true
+			break
 		}
-		emitOutgoing(data)
+		if len(data) > maxGatewayEventBytes {
+			emitLog("gateway_poll: valid event exceeds transport capacity; retrying")
+			capacityFailure = true
+			break
+		}
+		pending.Event = data
+		if !appendPending(pending) {
+			capacityFailure = true
+			break
+		}
+		changed = true
+	}
+	advanceAcceptedPrefix()
+	if changed && !persistDurableState() {
+		stateReady = false
+		emitLog("gateway_poll: durable state unavailable")
+		return 1
+	}
+	emitPending()
+	if capacityFailure {
+		emitLog("gateway_poll: internal capacity backpressure")
+		return 1
 	}
 
 	return 0
 }
 
-var responseBuf [4096]byte
+var responseBuf [maxHTTPResponseBytes]byte
 
 // ── Event handler ─────────────────────────────────────────────────────────
 
 //export gateway_handle_event
 func gatewayHandleEvent(ptr uint32, size uint32) int32 {
-	if size == 0 || size > 4096 {
+	if size == 0 || size > uint32(len(eventBuffer)) {
 		emitLog("gateway_handle_event: bad size")
 		return 0
 	}
@@ -337,11 +693,226 @@ func gatewayHandleEvent(ptr uint32, size uint32) int32 {
 		emitOutgoing([]byte("token:" + tok))
 	case "http_request":
 		handleHTTPRequest(string(ev.Payload))
+	case "session.route":
+		var route struct {
+			ChatID     int64  `json:"chat_id"`
+			DeliveryID string `json:"delivery_id"`
+		}
+		if json.Unmarshal(ev.Payload, &route) != nil || route.ChatID == 0 {
+			emitLog("session.route: invalid payload")
+			return 0
+		}
+		outboundChatID, outboundID = route.ChatID, route.DeliveryID
+	case "session.event":
+		handleSessionEvent(ev.Payload)
+	case "inbound.accepted":
+		var accepted struct {
+			EventID string `json:"event_id"`
+		}
+		if json.Unmarshal(ev.Payload, &accepted) != nil || accepted.EventID == "" {
+			emitLog("inbound.accepted: invalid payload")
+			return 0
+		}
+		acceptInbound(accepted.EventID)
 	default:
 		emitLog("gateway_event: unknown event type " + ev.Type)
 	}
 
 	return 0
+}
+
+func handleSessionEvent(payload json.RawMessage) {
+	text := ""
+	deliveryID := outboundID
+	chatID := outboundChatID
+	// A route applies to exactly one following Session event. Core sends a
+	// fresh route for retries, so stale routing state cannot cross-correlate.
+	outboundID, outboundChatID = "", 0
+	var delivery struct {
+		DeliveryID string `json:"delivery_id"`
+		Event      struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		} `json:"event"`
+	}
+	if json.Unmarshal(payload, &delivery) == nil && delivery.Event.Type != "" {
+		if delivery.DeliveryID != "" && deliveryID != "" && delivery.DeliveryID != deliveryID {
+			emitDeliveryResult(deliveryID, false, "delivery correlation mismatch")
+			return
+		}
+		switch delivery.Event.Type {
+		case "message":
+			var message struct {
+				Parts []struct{ Type, Text string } `json:"parts"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &message) == nil {
+				var parts []string
+				for _, part := range message.Parts {
+					if part.Type == "text" && part.Text != "" {
+						parts = append(parts, part.Text)
+					}
+				}
+				text = strings.Join(parts, "\n")
+			}
+		case "permission.requested":
+			var request struct {
+				RequestID string `json:"request_id"`
+				Question  string `json:"question"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &request) == nil {
+				text = request.Question + "\n\nReply /approve " + request.RequestID + " or /deny " + request.RequestID
+			}
+		case "status", "error":
+			var status struct {
+				Status  string `json:"status"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(delivery.Event.Payload, &status) == nil {
+				text = status.Message
+				if text == "" {
+					text = status.Status
+				}
+			}
+		}
+	} else {
+		var legacy struct {
+			Text string `json:"text"`
+		}
+		_ = json.Unmarshal(payload, &legacy)
+		text = legacy.Text
+	}
+	if deliveryID == "" || chatID == 0 || text == "" {
+		emitDeliveryResult(deliveryID, false, "unsupported session event")
+		return
+	}
+	if len(deliveryID) > maxDeliveryIDBytes {
+		emitDeliveryResult(deliveryID, false, "delivery ID exceeds limit")
+		return
+	}
+	if deliveryRecorded(deliveryID) {
+		emitDeliveryResult(deliveryID, true, "")
+		return
+	}
+	if !stateReady {
+		emitDeliveryResult(deliveryID, false, "durable state unavailable")
+		return
+	}
+	ok, deliveryError := sendTelegramText(chatID, text)
+	if ok && !recordDelivery(deliveryID) {
+		emitDeliveryResult(deliveryID, false, "durable state unavailable")
+		return
+	}
+	emitDeliveryResult(deliveryID, ok, deliveryError)
+}
+
+func deliveryRecorded(deliveryID string) bool {
+	for _, recorded := range durable.Deliveries {
+		if recorded == deliveryID {
+			return true
+		}
+	}
+	return false
+}
+
+func recordDelivery(deliveryID string) bool {
+	if deliveryID == "" || len(deliveryID) > maxDeliveryIDBytes {
+		return false
+	}
+	if deliveryRecorded(deliveryID) {
+		return true
+	}
+	original := append([]string(nil), durable.Deliveries...)
+	durable.Deliveries = append(durable.Deliveries, deliveryID)
+	if len(durable.Deliveries) > 256 {
+		durable.Deliveries = durable.Deliveries[len(durable.Deliveries)-256:]
+	}
+	for {
+		if _, ok := marshalDurableState(); ok {
+			break
+		}
+		if len(durable.Deliveries) <= 1 {
+			durable.Deliveries = original
+			return false
+		}
+		durable.Deliveries = durable.Deliveries[1:]
+	}
+	if !persistDurableState() {
+		durable.Deliveries = original
+		stateReady = false
+		return false
+	}
+	return true
+}
+
+func sendTelegramText(chatID int64, text string) (bool, string) {
+	if token == "" {
+		return false, "telegram token unavailable"
+	}
+	base := telegramHost
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	requestURL := base + "/bot" + token + "/sendMessage?chat_id=" + strconv.FormatInt(chatID, 10) + "&text=" + queryEscape(text)
+	var result [12]byte
+	hostHTTPGet(uint32(uintptr(unsafe.Pointer(unsafe.StringData(requestURL)))), uint32(len(requestURL)),
+		uint32(uintptr(unsafe.Pointer(&responseBuf[0]))), uint32(len(responseBuf)), uint32(uintptr(unsafe.Pointer(&result[0]))))
+	written := uint32(result[0]) | uint32(result[1])<<8 | uint32(result[2])<<16 | uint32(result[3])<<24
+	code := uint32(result[4]) | uint32(result[5])<<8 | uint32(result[6])<<16 | uint32(result[7])<<24
+	if code != 0 {
+		return false, "telegram sendMessage HTTP failure"
+	}
+	if written == 0 || written > uint32(len(responseBuf)) {
+		return false, "telegram sendMessage empty response"
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result *struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(responseBuf[:written], &response) != nil {
+		return false, "telegram sendMessage malformed response"
+	}
+	if !response.OK {
+		return false, "telegram sendMessage rejected"
+	}
+	if response.Result == nil || response.Result.MessageID <= 0 {
+		return false, "telegram sendMessage invalid result"
+	}
+	return true, ""
+}
+
+func emitDeliveryResult(deliveryID string, ok bool, message string) {
+	result := struct {
+		EventType  string `json:"event_type"`
+		DeliveryID string `json:"delivery_id,omitempty"`
+		OK         bool   `json:"ok"`
+		Error      string `json:"error,omitempty"`
+	}{
+		EventType: "delivery.result", DeliveryID: deliveryID, OK: ok,
+	}
+	if !ok {
+		result.Error = message
+	}
+	data, _ := json.Marshal(result)
+	emitOutgoing(data)
+}
+
+func queryEscape(value string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-_.~", rune(c)) {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+		}
+	}
+	return b.String()
 }
 
 func handleHTTPRequest(payload string) {
