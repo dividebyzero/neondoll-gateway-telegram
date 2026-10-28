@@ -35,6 +35,12 @@ func hostTelegramToken(ptr, maxLen uint32) int32
 //go:wasmimport gateway_host log
 func hostEmitLog(ptr, size uint32)
 
+//go:wasmimport gateway_host state_get
+func hostStateGet(keyPtr, keyLen, valuePtr, valueMax uint32) int32
+
+//go:wasmimport gateway_host state_put
+func hostStatePut(keyPtr, keyLen, valuePtr, valueLen uint32) int32
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 var logBuf [256]byte
@@ -134,6 +140,10 @@ func gatewayInit() int32 {
 	if haveTok {
 		token = tok
 	}
+	if !loadDurableState() {
+		emitLog("gateway_init: durable state capability unavailable")
+		panic("durable state capability unavailable")
+	}
 	return 0
 }
 
@@ -147,7 +157,122 @@ var (
 	telegramHost   string
 	outboundChatID int64
 	outboundID     string
+	durable        durableState
+	stateReady     bool
 )
+
+const durableStateKey = "telegram.gateway.v1"
+
+type durableState struct {
+	Offset     int64           `json:"offset,omitempty"`
+	Pending    []pendingUpdate `json:"pending,omitempty"`
+	Deliveries []string        `json:"deliveries,omitempty"`
+}
+
+type pendingUpdate struct {
+	UpdateID int64           `json:"update_id"`
+	Event    json.RawMessage `json:"event,omitempty"`
+	Acked    bool            `json:"acked,omitempty"`
+	Emitted  bool            `json:"-"`
+}
+
+var durableStateBuf [65536]byte
+
+func loadDurableState() bool {
+	key := []byte(durableStateKey)
+	n := hostStateGet(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&durableStateBuf[0]))), uint32(len(durableStateBuf)))
+	if n >= 0 {
+		if n > 0 && json.Unmarshal(durableStateBuf[:n], &durable) != nil {
+			emitLog("durable state is invalid")
+			return false
+		}
+		offset = durable.Offset
+		stateReady = true
+		return true
+	}
+	// A missing key and a denied capability both return -1 in ABI v2.
+	// Writing the initial state distinguishes a usable empty store from a
+	// missing capability without weakening fail-closed behavior.
+	durable = durableState{}
+	stateReady = persistDurableState()
+	return stateReady
+}
+
+func persistDurableState() bool {
+	durable.Offset = offset
+	data, err := json.Marshal(durable)
+	if err != nil || len(data) > len(durableStateBuf) {
+		return false
+	}
+	key := []byte(durableStateKey)
+	if len(data) == 0 {
+		return false
+	}
+	return hostStatePut(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data))) == 0
+}
+
+func pendingIndex(updateID int64) int {
+	for i := range durable.Pending {
+		if durable.Pending[i].UpdateID == updateID {
+			return i
+		}
+	}
+	return -1
+}
+
+func advanceAcceptedPrefix() {
+	for len(durable.Pending) > 0 && durable.Pending[0].Acked {
+		if next := durable.Pending[0].UpdateID + 1; next > offset {
+			offset = next
+		}
+		durable.Pending = durable.Pending[1:]
+	}
+}
+
+func emitPending() {
+	for i := range durable.Pending {
+		pending := &durable.Pending[i]
+		if pending.Acked || pending.Emitted || len(pending.Event) == 0 {
+			continue
+		}
+		emitOutgoing(pending.Event)
+		pending.Emitted = true
+	}
+}
+
+func acceptInbound(eventID string) {
+	updateID, err := strconv.ParseInt(eventID, 10, 64)
+	if err != nil {
+		emitLog("inbound.accepted: invalid event_id")
+		return
+	}
+	index := pendingIndex(updateID)
+	if index < 0 {
+		if updateID >= offset {
+			emitLog("inbound.accepted: unknown event_id")
+		}
+		return
+	}
+	durable.Pending[index].Acked = true
+	advanceAcceptedPrefix()
+	if !persistDurableState() {
+		stateReady = false
+		emitLog("inbound.accepted: durable state unavailable")
+	}
+}
+
+func appendPending(pending pendingUpdate) {
+	index := len(durable.Pending)
+	for i := range durable.Pending {
+		if pending.UpdateID < durable.Pending[i].UpdateID {
+			index = i
+			break
+		}
+	}
+	durable.Pending = append(durable.Pending, pendingUpdate{})
+	copy(durable.Pending[index+1:], durable.Pending[index:])
+	durable.Pending[index] = pending
+}
 
 // ── JSON array URL encoding ───────────────────────────────────────────────
 
@@ -186,9 +311,21 @@ func encodeJSONArray(elems []string) string {
 
 //export gateway_poll
 func gatewayPoll() int32 {
+	if !stateReady {
+		emitLog("gateway_poll: durable state unavailable")
+		panic("durable state unavailable")
+	}
 	if token == "" {
 		emitLog("gateway_poll: no token configured")
 		return 0
+	}
+	// Restored, unacknowledged updates are retried before asking Telegram for
+	// newer work. Emitted is intentionally process-local and resets on restart.
+	for i := range durable.Pending {
+		if !durable.Pending[i].Acked && !durable.Pending[i].Emitted {
+			emitPending()
+			return 0
+		}
 	}
 
 	// Build the URL.
@@ -257,12 +394,19 @@ func gatewayPoll() int32 {
 		emitLog("gateway_poll: telegram returned not ok")
 		return 0
 	}
+	changed := false
 	for _, u := range tgResp.Result {
 		if u.UpdateID < offset {
 			continue
 		}
-		offset = u.UpdateID + 1
+		if pendingIndex(u.UpdateID) >= 0 {
+			continue
+		}
+		pending := pendingUpdate{UpdateID: u.UpdateID}
 		if u.Message == nil || u.Message.Text == "" {
+			pending.Acked = true
+			appendPending(pending)
+			changed = true
 			continue
 		}
 		// Emit a gateway event in GatewayEventEnvelope format.
@@ -298,8 +442,17 @@ func gatewayPoll() int32 {
 			emitLog("gateway_poll: marshal event: " + err.Error())
 			continue
 		}
-		emitOutgoing(data)
+		pending.Event = data
+		appendPending(pending)
+		changed = true
 	}
+	advanceAcceptedPrefix()
+	if changed && !persistDurableState() {
+		stateReady = false
+		emitLog("gateway_poll: durable state unavailable")
+		return 1
+	}
+	emitPending()
 
 	return 0
 }
@@ -351,6 +504,15 @@ func gatewayHandleEvent(ptr uint32, size uint32) int32 {
 		outboundChatID, outboundID = route.ChatID, route.DeliveryID
 	case "session.event":
 		handleSessionEvent(ev.Payload)
+	case "inbound.accepted":
+		var accepted struct {
+			EventID string `json:"event_id"`
+		}
+		if json.Unmarshal(ev.Payload, &accepted) != nil || accepted.EventID == "" {
+			emitLog("inbound.accepted: invalid payload")
+			return 0
+		}
+		acceptInbound(accepted.EventID)
 	default:
 		emitLog("gateway_event: unknown event type " + ev.Type)
 	}
@@ -361,6 +523,10 @@ func gatewayHandleEvent(ptr uint32, size uint32) int32 {
 func handleSessionEvent(payload json.RawMessage) {
 	text := ""
 	deliveryID := outboundID
+	chatID := outboundChatID
+	// A route applies to exactly one following Session event. Core sends a
+	// fresh route for retries, so stale routing state cannot cross-correlate.
+	outboundID, outboundChatID = "", 0
 	var delivery struct {
 		DeliveryID string `json:"delivery_id"`
 		Event      struct {
@@ -369,8 +535,9 @@ func handleSessionEvent(payload json.RawMessage) {
 		} `json:"event"`
 	}
 	if json.Unmarshal(payload, &delivery) == nil && delivery.Event.Type != "" {
-		if delivery.DeliveryID != "" {
-			deliveryID = delivery.DeliveryID
+		if delivery.DeliveryID != "" && deliveryID != "" && delivery.DeliveryID != deliveryID {
+			emitDeliveryResult(deliveryID, false, "delivery correlation mismatch")
+			return
 		}
 		switch delivery.Event.Type {
 		case "message":
@@ -414,12 +581,48 @@ func handleSessionEvent(payload json.RawMessage) {
 		_ = json.Unmarshal(payload, &legacy)
 		text = legacy.Text
 	}
-	if outboundChatID == 0 || text == "" {
+	if deliveryID == "" || chatID == 0 || text == "" {
 		emitDeliveryResult(deliveryID, false, "unsupported session event")
 		return
 	}
-	ok := sendTelegramText(outboundChatID, text)
+	if deliveryRecorded(deliveryID) {
+		emitDeliveryResult(deliveryID, true, "")
+		return
+	}
+	if !stateReady {
+		emitDeliveryResult(deliveryID, false, "durable state unavailable")
+		return
+	}
+	ok := sendTelegramText(chatID, text)
+	if ok && !recordDelivery(deliveryID) {
+		emitDeliveryResult(deliveryID, false, "durable state unavailable")
+		return
+	}
 	emitDeliveryResult(deliveryID, ok, "telegram sendMessage failed")
+}
+
+func deliveryRecorded(deliveryID string) bool {
+	for _, recorded := range durable.Deliveries {
+		if recorded == deliveryID {
+			return true
+		}
+	}
+	return false
+}
+
+func recordDelivery(deliveryID string) bool {
+	if deliveryRecorded(deliveryID) {
+		return true
+	}
+	durable.Deliveries = append(durable.Deliveries, deliveryID)
+	if len(durable.Deliveries) > 256 {
+		durable.Deliveries = durable.Deliveries[len(durable.Deliveries)-256:]
+	}
+	if !persistDurableState() {
+		stateReady = false
+		return false
+	}
+	return true
 }
 
 func sendTelegramText(chatID int64, text string) bool {

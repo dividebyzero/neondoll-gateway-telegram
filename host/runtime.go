@@ -87,6 +87,7 @@ type GatewayRuntime struct {
 	allowedHosts  []string
 	httpTransport http.RoundTripper // injectable transport (tests use TLS test server)
 	httpClient    *http.Client      // built lazily from httpTransport + policy
+	stateStore    *MemoryStateStore // guest-test utility; Core owns production state
 
 	mu      sync.Mutex
 	state   runtimeState
@@ -118,6 +119,31 @@ type GatewayRuntime struct {
 	Outbound []contract.GatewayMessage
 }
 
+// MemoryStateStore implements the ABI v2 state capability for independent
+// guest tests. Passing the same store to a new runtime models a Core restart;
+// it is not a competing production persistence implementation.
+type MemoryStateStore struct {
+	mu     sync.Mutex
+	values map[string][]byte
+}
+
+func NewMemoryStateStore() *MemoryStateStore {
+	return &MemoryStateStore{values: make(map[string][]byte)}
+}
+
+func (s *MemoryStateStore) get(key string) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[key]
+	return append([]byte(nil), value...), ok
+}
+
+func (s *MemoryStateStore) put(key string, value []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values[key] = append([]byte(nil), value...)
+}
+
 // Option configures a GatewayRuntime.
 type Option func(*GatewayRuntime)
 
@@ -137,6 +163,12 @@ func WithConfig(cfg contract.GatewayConfig) Option {
 	return func(r *GatewayRuntime) { r.cfg = &cfg }
 }
 
+// WithStateStore shares ABI state across independently instantiated test
+// runtimes. Production state is supplied by Core's Extension runtime.
+func WithStateStore(state *MemoryStateStore) Option {
+	return func(r *GatewayRuntime) { r.stateStore = state }
+}
+
 type runtimeState int
 
 const (
@@ -152,7 +184,7 @@ func NewGatewayRuntime(allowedHosts []string, opts ...Option) *GatewayRuntime {
 	for _, h := range allowedHosts {
 		norm = append(norm, strings.ToLower(strings.TrimSpace(h)))
 	}
-	r := &GatewayRuntime{allowedHosts: norm, initDone: make(chan struct{})}
+	r := &GatewayRuntime{allowedHosts: norm, initDone: make(chan struct{}), stateStore: NewMemoryStateStore()}
 	for _, o := range opts {
 		o(r)
 	}
@@ -261,6 +293,16 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 			return r.hostTelegramToken(m, ptr, maxLen)
 		}).
 		Export("telegram_token")
+	builder.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, m api.Module, keyPtr, keyLen, valuePtr, valueMax uint32) int32 {
+			return r.hostStateGet(m, keyPtr, keyLen, valuePtr, valueMax)
+		}).
+		Export("state_get")
+	builder.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, m api.Module, keyPtr, keyLen, valuePtr, valueLen uint32) int32 {
+			return r.hostStatePut(m, keyPtr, keyLen, valuePtr, valueLen)
+		}).
+		Export("state_put")
 	if _, err := builder.Instantiate(ctx); err != nil {
 		return fail(fmt.Errorf("instantiate host module: %w", err))
 	}
@@ -662,6 +704,28 @@ func (r *GatewayRuntime) hostTelegramToken(m api.Module, ptr, maxLen uint32) int
 		return 0
 	}
 	return int32(len(tok))
+}
+
+func (r *GatewayRuntime) hostStateGet(m api.Module, keyPtr, keyLen, valuePtr, valueMax uint32) int32 {
+	key, ok := m.Memory().Read(keyPtr, keyLen)
+	if !ok || len(key) == 0 || r.stateStore == nil {
+		return -1
+	}
+	value, ok := r.stateStore.get(string(key))
+	if !ok || uint32(len(value)) > valueMax || !m.Memory().Write(valuePtr, value) {
+		return -1
+	}
+	return int32(len(value))
+}
+
+func (r *GatewayRuntime) hostStatePut(m api.Module, keyPtr, keyLen, valuePtr, valueLen uint32) int32 {
+	key, keyOK := m.Memory().Read(keyPtr, keyLen)
+	value, valueOK := m.Memory().Read(valuePtr, valueLen)
+	if !keyOK || !valueOK || len(key) == 0 || r.stateStore == nil {
+		return -1
+	}
+	r.stateStore.put(string(key), value)
+	return 0
 }
 
 func (r *GatewayRuntime) appendLog(msg string) {

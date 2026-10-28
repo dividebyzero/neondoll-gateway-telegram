@@ -191,7 +191,12 @@ func TestTelegramPollMockServer(t *testing.T) {
 			t.Fatalf("poll #1 events: got %d, want 1", len(envs))
 		}
 
-		// Second poll: offset should have advanced past 5
+		// Core acceptance, not fetch/emission, advances the durable cursor.
+		if err := r.HandleEvent(contract.Version0, "inbound.accepted", `{"event_id":"5"}`); err != nil {
+			t.Fatalf("accept update: %v", err)
+		}
+
+		// Second poll: offset should now have advanced past 5.
 		// Server returns the same update_id=5 (already processed) — must be skipped.
 		if err := r.Poll(); err != nil {
 			t.Fatalf("Poll #2: %v", err)
