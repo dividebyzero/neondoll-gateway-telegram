@@ -168,14 +168,14 @@ func TestTelegramPollMockServer(t *testing.T) {
 					t.Errorf("first call offset=%q, want empty or 0", offset)
 				}
 				_, _ = w.Write([]byte(`{"ok":true,"result":[
-					{"update_id":5,"message":{"message_id":20,"chat":{"id":300,"type":"private"},"date":1700000010,"text":"a"}}
+					{"update_id":5,"message":{"message_id":20,"from":{"id":30},"chat":{"id":300,"type":"private"},"date":1700000010,"text":"a"}}
 				]}`))
 			case 2:
 				if offset != "6" {
 					t.Errorf("second call offset=%q, want 6", offset)
 				}
 				_, _ = w.Write([]byte(`{"ok":true,"result":[
-					{"update_id":5,"message":{"message_id":20,"chat":{"id":300,"type":"private"},"date":1700000010,"text":"a"}}
+					{"update_id":5,"message":{"message_id":20,"from":{"id":30},"chat":{"id":300,"type":"private"},"date":1700000010,"text":"a"}}
 				]}`))
 			default:
 				t.Errorf("unexpected call #%d", callNum)
@@ -212,7 +212,7 @@ func TestTelegramPollMockServer(t *testing.T) {
 		r := setupPollTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true,"result":[
-				{"update_id":100,"message":{"message_id":999,"from":{"id":-1234567890123,"is_bot":false,"first_name":"GroupBot"},
+				{"update_id":100,"message":{"message_id":999,"from":{"id":1234567890123,"is_bot":false,"first_name":"GroupBot"},
 					"chat":{"id":-987654321098,"type":"supergroup"},"date":1700000020,"text":"hello group"}},
 				{"update_id":101,"message":{"message_id":1000,"from":{"id":9223372036854775807,"is_bot":false,"first_name":"MaxInt"},
 					"chat":{"id":-1001234567890,"type":"group"},"date":1700000021,"text":"large ints"}}
@@ -232,8 +232,8 @@ func TestTelegramPollMockServer(t *testing.T) {
 		if envs[0].UpdateID != 100 {
 			t.Fatalf("update_id = %d, want 100", envs[0].UpdateID)
 		}
-		if got := envs[0].SenderID; got != -1234567890123 {
-			t.Fatalf("sender_id = %d, want -1234567890123", got)
+		if got := envs[0].SenderID; got != 1234567890123 {
+			t.Fatalf("sender_id = %d, want 1234567890123", got)
 		}
 		if got := envs[0].ChatID; got != -987654321098 {
 			t.Fatalf("chat_id = %d, want -987654321098", got)
@@ -259,7 +259,7 @@ func TestTelegramPollMockServer(t *testing.T) {
 		r := setupPollTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true,"result":[{"update_id":50,"message":{
-				"message_id":5,"chat":{"id":100,"type":"private"},
+				"message_id":5,"from":{"id":10},"chat":{"id":100,"type":"private"},
 				"date":1700000030,"text":"Hello \"world\" & <script>alert(1)<\/script> \u00e9\u00e0\u00fc"
 			}}]}`)) // eslint-disable-line
 		}), nil)
@@ -350,9 +350,9 @@ func TestTelegramPollMockServer(t *testing.T) {
 		r := setupPollTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true,"result":[
-				{"update_id":10,"message":{"message_id":1,"chat":{"id":100,"type":"private"},"date":1700000040,"text":"valid"}},
+				{"update_id":10,"message":{"message_id":1,"from":{"id":10},"chat":{"id":100,"type":"private"},"date":1700000040,"text":"valid"}},
 				{"update_id":11,"callback_query":{"id":"cb1","from":{"id":999,"is_bot":false,"first_name":"Bot"}}},
-				{"update_id":12,"message":{"message_id":2,"chat":{"id":101,"type":"group"},"date":1700000041,"text":"also valid"}}
+				{"update_id":12,"message":{"message_id":2,"from":{"id":12},"chat":{"id":101,"type":"group"},"date":1700000041,"text":"also valid"}}
 			]}`))
 		}), nil)
 
@@ -373,9 +373,9 @@ func TestTelegramPollMockServer(t *testing.T) {
 		r := setupPollTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true,"result":[
-				{"update_id":20,"message":{"message_id":3,"chat":{"id":200,"type":"private"},"date":1700000050,"text":"has text"}},
-				{"update_id":21,"message":{"message_id":4,"chat":{"id":201,"type":"private"},"date":1700000051,"text":""}},
-				{"update_id":22,"message":{"message_id":5,"chat":{"id":202,"type":"private"},"date":1700000052,"text":"also text"}}
+				{"update_id":20,"message":{"message_id":3,"from":{"id":20},"chat":{"id":200,"type":"private"},"date":1700000050,"text":"has text"}},
+				{"update_id":21,"message":{"message_id":4,"from":{"id":21},"chat":{"id":201,"type":"private"},"date":1700000051,"text":""}},
+				{"update_id":22,"message":{"message_id":5,"from":{"id":22},"chat":{"id":202,"type":"private"},"date":1700000052,"text":"also text"}}
 			]}`))
 		}), nil)
 

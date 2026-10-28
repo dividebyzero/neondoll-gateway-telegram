@@ -161,7 +161,14 @@ var (
 	stateReady     bool
 )
 
-const durableStateKey = "telegram.gateway.v1"
+const (
+	durableStateKey      = "telegram.gateway.v1"
+	maxPendingUpdates    = 16
+	maxDurableStateBytes = 48 * 1024
+	maxPendingEventBytes = 3 * 1024
+	maxDeliveryIDBytes   = 256
+	durableStateHeadroom = maxPendingEventBytes + 512
+)
 
 type durableState struct {
 	Offset     int64           `json:"offset,omitempty"`
@@ -173,6 +180,7 @@ type pendingUpdate struct {
 	UpdateID int64           `json:"update_id"`
 	Event    json.RawMessage `json:"event,omitempty"`
 	Acked    bool            `json:"acked,omitempty"`
+	Blocked  string          `json:"blocked,omitempty"`
 	Emitted  bool            `json:"-"`
 }
 
@@ -182,7 +190,7 @@ func loadDurableState() bool {
 	key := []byte(durableStateKey)
 	n := hostStateGet(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&durableStateBuf[0]))), uint32(len(durableStateBuf)))
 	if n >= 0 {
-		if n > 0 && json.Unmarshal(durableStateBuf[:n], &durable) != nil {
+		if n > maxDurableStateBytes || n > 0 && json.Unmarshal(durableStateBuf[:n], &durable) != nil || !validDurableState() {
 			emitLog("durable state is invalid")
 			return false
 		}
@@ -200,8 +208,8 @@ func loadDurableState() bool {
 
 func persistDurableState() bool {
 	durable.Offset = offset
-	data, err := json.Marshal(durable)
-	if err != nil || len(data) > len(durableStateBuf) {
+	data, ok := marshalDurableState()
+	if !ok {
 		return false
 	}
 	key := []byte(durableStateKey)
@@ -209,6 +217,31 @@ func persistDurableState() bool {
 		return false
 	}
 	return hostStatePut(uint32(uintptr(unsafe.Pointer(&key[0]))), uint32(len(key)), uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data))) == 0
+}
+
+func marshalDurableState() ([]byte, bool) {
+	data, err := json.Marshal(durable)
+	return data, err == nil && len(data) <= maxDurableStateBytes
+}
+
+func validDurableState() bool {
+	if len(durable.Pending) > maxPendingUpdates {
+		return false
+	}
+	previous := int64(-1)
+	for _, pending := range durable.Pending {
+		if pending.UpdateID < 0 || pending.UpdateID <= previous || len(pending.Event) > maxPendingEventBytes {
+			return false
+		}
+		previous = pending.UpdateID
+	}
+	for _, deliveryID := range durable.Deliveries {
+		if deliveryID == "" || len(deliveryID) > maxDeliveryIDBytes {
+			return false
+		}
+	}
+	_, ok := marshalDurableState()
+	return ok
 }
 
 func pendingIndex(updateID int64) int {
@@ -240,6 +273,19 @@ func emitPending() {
 	}
 }
 
+func pendingBackpressure() bool {
+	if len(durable.Pending) >= maxPendingUpdates {
+		return true
+	}
+	for _, pending := range durable.Pending {
+		if pending.Blocked != "" {
+			return true
+		}
+	}
+	data, ok := marshalDurableState()
+	return !ok || len(data) > maxDurableStateBytes-durableStateHeadroom
+}
+
 func acceptInbound(eventID string) {
 	updateID, err := strconv.ParseInt(eventID, 10, 64)
 	if err != nil {
@@ -261,7 +307,10 @@ func acceptInbound(eventID string) {
 	}
 }
 
-func appendPending(pending pendingUpdate) {
+func appendPending(pending pendingUpdate) bool {
+	if len(durable.Pending) >= maxPendingUpdates {
+		return false
+	}
 	index := len(durable.Pending)
 	for i := range durable.Pending {
 		if pending.UpdateID < durable.Pending[i].UpdateID {
@@ -272,6 +321,11 @@ func appendPending(pending pendingUpdate) {
 	durable.Pending = append(durable.Pending, pendingUpdate{})
 	copy(durable.Pending[index+1:], durable.Pending[index:])
 	durable.Pending[index] = pending
+	if _, ok := marshalDurableState(); !ok {
+		durable.Pending = append(durable.Pending[:index], durable.Pending[index+1:]...)
+		return false
+	}
+	return true
 }
 
 // ── JSON array URL encoding ───────────────────────────────────────────────
@@ -322,10 +376,18 @@ func gatewayPoll() int32 {
 	// Restored, unacknowledged updates are retried before asking Telegram for
 	// newer work. Emitted is intentionally process-local and resets on restart.
 	for i := range durable.Pending {
+		if durable.Pending[i].Blocked != "" {
+			emitLog("gateway_poll: pending update requires backpressure: " + durable.Pending[i].Blocked)
+			return 0
+		}
 		if !durable.Pending[i].Acked && !durable.Pending[i].Emitted {
 			emitPending()
 			return 0
 		}
+	}
+	if pendingBackpressure() {
+		emitLog("gateway_poll: pending queue backpressure")
+		return 0
 	}
 
 	// Build the URL.
@@ -375,6 +437,7 @@ func gatewayPoll() int32 {
 				MessageID int64 `json:"message_id"`
 				From      *struct {
 					ID        int64  `json:"id"`
+					IsBot     bool   `json:"is_bot"`
 					FirstName string `json:"first_name"`
 				} `json:"from"`
 				Chat struct {
@@ -396,7 +459,10 @@ func gatewayPoll() int32 {
 	}
 	changed := false
 	for _, u := range tgResp.Result {
-		if u.UpdateID < offset {
+		if u.UpdateID < offset || u.UpdateID < 0 {
+			if u.UpdateID < 0 {
+				emitLog("gateway_poll: unsupported invalid update_id")
+			}
 			continue
 		}
 		if pendingIndex(u.UpdateID) >= 0 {
@@ -404,8 +470,20 @@ func gatewayPoll() int32 {
 		}
 		pending := pendingUpdate{UpdateID: u.UpdateID}
 		if u.Message == nil || u.Message.Text == "" {
+			emitLog("gateway_poll: unsupported update type")
 			pending.Acked = true
-			appendPending(pending)
+			if !appendPending(pending) {
+				break
+			}
+			changed = true
+			continue
+		}
+		if u.Message.MessageID <= 0 || u.Message.Chat.ID == 0 || u.Message.From == nil || u.Message.From.ID <= 0 || u.Message.From.IsBot {
+			emitLog("gateway_poll: unsupported message sender")
+			pending.Acked = true
+			if !appendPending(pending) {
+				break
+			}
 			changed = true
 			continue
 		}
@@ -442,8 +520,19 @@ func gatewayPoll() int32 {
 			emitLog("gateway_poll: marshal event: " + err.Error())
 			continue
 		}
+		if len(data) > maxPendingEventBytes {
+			emitLog("gateway_poll: update exceeds durable event limit")
+			pending.Blocked = "oversized update"
+			if !appendPending(pending) {
+				break
+			}
+			changed = true
+			break
+		}
 		pending.Event = data
-		appendPending(pending)
+		if !appendPending(pending) {
+			break
+		}
 		changed = true
 	}
 	advanceAcceptedPrefix()
@@ -585,6 +674,10 @@ func handleSessionEvent(payload json.RawMessage) {
 		emitDeliveryResult(deliveryID, false, "unsupported session event")
 		return
 	}
+	if len(deliveryID) > maxDeliveryIDBytes {
+		emitDeliveryResult(deliveryID, false, "delivery ID exceeds limit")
+		return
+	}
 	if deliveryRecorded(deliveryID) {
 		emitDeliveryResult(deliveryID, true, "")
 		return
@@ -593,12 +686,12 @@ func handleSessionEvent(payload json.RawMessage) {
 		emitDeliveryResult(deliveryID, false, "durable state unavailable")
 		return
 	}
-	ok := sendTelegramText(chatID, text)
+	ok, deliveryError := sendTelegramText(chatID, text)
 	if ok && !recordDelivery(deliveryID) {
 		emitDeliveryResult(deliveryID, false, "durable state unavailable")
 		return
 	}
-	emitDeliveryResult(deliveryID, ok, "telegram sendMessage failed")
+	emitDeliveryResult(deliveryID, ok, deliveryError)
 }
 
 func deliveryRecorded(deliveryID string) bool {
@@ -611,23 +704,38 @@ func deliveryRecorded(deliveryID string) bool {
 }
 
 func recordDelivery(deliveryID string) bool {
+	if deliveryID == "" || len(deliveryID) > maxDeliveryIDBytes {
+		return false
+	}
 	if deliveryRecorded(deliveryID) {
 		return true
 	}
+	original := append([]string(nil), durable.Deliveries...)
 	durable.Deliveries = append(durable.Deliveries, deliveryID)
 	if len(durable.Deliveries) > 256 {
 		durable.Deliveries = durable.Deliveries[len(durable.Deliveries)-256:]
 	}
+	for {
+		if _, ok := marshalDurableState(); ok {
+			break
+		}
+		if len(durable.Deliveries) <= 1 {
+			durable.Deliveries = original
+			return false
+		}
+		durable.Deliveries = durable.Deliveries[1:]
+	}
 	if !persistDurableState() {
+		durable.Deliveries = original
 		stateReady = false
 		return false
 	}
 	return true
 }
 
-func sendTelegramText(chatID int64, text string) bool {
+func sendTelegramText(chatID int64, text string) (bool, string) {
 	if token == "" {
-		return false
+		return false, "telegram token unavailable"
 	}
 	base := telegramHost
 	if base == "" {
@@ -637,8 +745,30 @@ func sendTelegramText(chatID int64, text string) bool {
 	var result [12]byte
 	hostHTTPGet(uint32(uintptr(unsafe.Pointer(unsafe.StringData(requestURL)))), uint32(len(requestURL)),
 		uint32(uintptr(unsafe.Pointer(&responseBuf[0]))), uint32(len(responseBuf)), uint32(uintptr(unsafe.Pointer(&result[0]))))
+	written := uint32(result[0]) | uint32(result[1])<<8 | uint32(result[2])<<16 | uint32(result[3])<<24
 	code := uint32(result[4]) | uint32(result[5])<<8 | uint32(result[6])<<16 | uint32(result[7])<<24
-	return code == 0
+	if code != 0 {
+		return false, "telegram sendMessage HTTP failure"
+	}
+	if written == 0 || written > uint32(len(responseBuf)) {
+		return false, "telegram sendMessage empty response"
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result *struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(responseBuf[:written], &response) != nil {
+		return false, "telegram sendMessage malformed response"
+	}
+	if !response.OK {
+		return false, "telegram sendMessage rejected"
+	}
+	if response.Result == nil || response.Result.MessageID <= 0 {
+		return false, "telegram sendMessage invalid result"
+	}
+	return true, ""
 }
 
 func emitDeliveryResult(deliveryID string, ok bool, message string) {

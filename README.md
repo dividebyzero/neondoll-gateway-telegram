@@ -45,13 +45,20 @@ only after Core sends:
 
 Acknowledgements may arrive out of order, but the cursor advances only through
 the accepted prefix. Pending updates retry after restart and later updates
-cannot skip an earlier unacknowledged update.
+cannot skip an earlier unacknowledged update. The guest accepts at most 16
+pending updates, 48 KiB of serialized durable state, and 3 KiB per inbound
+event. It stops requesting new updates while those bounds require backpressure;
+an oversized update remains as a durable blocker so the cursor cannot move past
+it. Missing, invalid, or bot sender identities and unsupported update types are
+logged and never emitted as ordinary user messages. Core remains the final
+identity and permission authority for emitted events.
 
 For outbound traffic Core sends `session.route`, including its stable
 `delivery_id`, followed by `session.event`. Telegram reports the same ID in
-`delivery.result` only after the Bot API request completes. Confirmed delivery
-IDs are retained in bounded durable state so a Core retry does not resend a
-recently confirmed message.
+`delivery.result` only after the Bot API returns HTTP success, valid JSON,
+`ok: true`, and a valid sent-message result. Confirmed delivery IDs are retained
+in bounded durable state so a Core retry does not resend a recently confirmed
+message.
 
 ## Testing
 
