@@ -279,9 +279,9 @@ func TestHTTPNon2xxIsExplicit(t *testing.T) {
 }
 
 func TestHTTPOversizedBodyIsExplicit(t *testing.T) {
-	// Server returns 8000 bytes; the guest's respBuf is 4096.
+	// The response exceeds the guest's explicit 4 MiB safety buffer.
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(make([]byte, 8000))
+		_, _ = w.Write(make([]byte, (4<<20)+1))
 	}))
 	defer srv.Close()
 

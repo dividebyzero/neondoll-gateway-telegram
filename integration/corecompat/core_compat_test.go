@@ -30,6 +30,7 @@ type ingress struct {
 	failures int
 	attempts int
 	accepted int
+	events   []*events.Event
 }
 
 func (*ingress) ResolvePlatformSession(context.Context, string) (session.ID, error) {
@@ -40,7 +41,7 @@ func (*ingress) ExternalConversationRef(context.Context, session.ID) (string, er
 	return "telegram/chat/7", nil
 }
 
-func (i *ingress) HandleLegacy(_ context.Context, _ session.ID, _ gateway.VerifiedSender, _ *events.Event) (*events.Event, error) {
+func (i *ingress) HandleLegacy(_ context.Context, _ session.ID, _ gateway.VerifiedSender, event *events.Event) (*events.Event, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.attempts++
@@ -49,6 +50,10 @@ func (i *ingress) HandleLegacy(_ context.Context, _ session.ID, _ gateway.Verifi
 		return nil, errors.New("transient ingress rejection")
 	}
 	i.accepted++
+	if event != nil {
+		copy := *event
+		i.events = append(i.events, &copy)
+	}
 	return nil, nil
 }
 
@@ -101,6 +106,19 @@ func TestMergedCoreExtensionManagerWithMockTelegram(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string
 	sendCount := 0
+	text := strings.Repeat("界", 4096)
+	update := map[string]any{
+		"update_id": 42,
+		"message": map[string]any{
+			"message_id": 1, "from": map[string]any{"id": 9},
+			"chat": map[string]any{"id": 7, "type": "private"}, "date": 1, "text": text,
+			"document": map[string]any{"file_id": "provider-file", "file_unique_id": "stable-file", "file_name": "report.pdf", "mime_type": "application/pdf", "file_size": 42},
+		},
+	}
+	updateResponse, err := json.Marshal(map[string]any{"ok": true, "result": []any{update}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		mu.Lock()
 		paths = append(paths, request.URL.RequestURI())
@@ -113,7 +131,7 @@ func TestMergedCoreExtensionManagerWithMockTelegram(t *testing.T) {
 		offset := request.URL.Query().Get("offset")
 		mu.Unlock()
 		if offset == "" || offset == "0" {
-			_, _ = w.Write([]byte(`{"ok":true,"result":[{"update_id":42,"message":{"message_id":1,"from":{"id":9},"chat":{"id":7,"type":"private"},"date":1,"text":"hello"}}]}`))
+			_, _ = w.Write(updateResponse)
 			return
 		}
 		_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
@@ -171,6 +189,16 @@ func TestMergedCoreExtensionManagerWithMockTelegram(t *testing.T) {
 		defer coreIngress.mu.Unlock()
 		return coreIngress.attempts >= 2 && coreIngress.accepted == 1
 	})
+	coreIngress.mu.Lock()
+	if len(coreIngress.events) != 1 {
+		coreIngress.mu.Unlock()
+		t.Fatalf("accepted events=%d", len(coreIngress.events))
+	}
+	payload, ok := coreIngress.events[0].Payload.(events.MessagePayload)
+	coreIngress.mu.Unlock()
+	if !ok || payload.Text != text || len(payload.Media) != 1 || payload.Media[0].MediaID != "provider-file" || payload.Media[0].UniqueID != "stable-file" {
+		t.Fatalf("payload text bytes=%d media=%+v", len(payload.Text), payload.Media)
+	}
 	waitFor(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()

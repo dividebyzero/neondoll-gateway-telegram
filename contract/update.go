@@ -18,11 +18,27 @@ type TelegramUpdate struct {
 
 // TelegramMessage is a message within a Telegram update.
 type TelegramMessage struct {
-	MessageID int64         `json:"message_id"`
-	From      *TelegramUser `json:"from,omitempty"`
-	Chat      TelegramChat  `json:"chat"`
-	Date      int64         `json:"date"`
-	Text      string        `json:"text,omitempty"`
+	MessageID int64           `json:"message_id"`
+	From      *TelegramUser   `json:"from,omitempty"`
+	Chat      TelegramChat    `json:"chat"`
+	Date      int64           `json:"date"`
+	Text      string          `json:"text,omitempty"`
+	Caption   string          `json:"caption,omitempty"`
+	Photo     []TelegramMedia `json:"photo,omitempty"`
+	Document  *TelegramMedia  `json:"document,omitempty"`
+	Audio     *TelegramMedia  `json:"audio,omitempty"`
+	Voice     *TelegramMedia  `json:"voice,omitempty"`
+	Video     *TelegramMedia  `json:"video,omitempty"`
+}
+
+// TelegramMedia contains references only. Binary content is retrieved later
+// through a separately authorized capability, never embedded in the event.
+type TelegramMedia struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id,omitempty"`
+	FileName     string `json:"file_name,omitempty"`
+	MIMEType     string `json:"mime_type,omitempty"`
+	FileSize     int64  `json:"file_size,omitempty"`
 }
 
 // TelegramUser represents a Telegram user.
@@ -77,6 +93,23 @@ type GatewayEventEnvelope struct {
 	// Text is the message text content.
 	Text string `json:"text"`
 
+	// Media contains provider-scoped metadata references, never file bytes.
+	Media []MediaReference `json:"media,omitempty"`
+
 	// ReceivedAt is the Unix timestamp from the Telegram message.
 	ReceivedAt int64 `json:"received_at"`
+}
+
+// MediaReference is the transport-neutral metadata boundary for future media
+// retrieval. MediaID is Telegram's file_id for this Gateway.
+type MediaReference struct {
+	Type           string `json:"type"`
+	MediaID        string `json:"media_id"`
+	UniqueID       string `json:"unique_id,omitempty"`
+	Filename       string `json:"filename,omitempty"`
+	MIMEType       string `json:"mime_type,omitempty"`
+	SizeBytes      int64  `json:"size_bytes,omitempty"`
+	Caption        string `json:"caption,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
 }

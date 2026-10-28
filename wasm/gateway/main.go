@@ -76,7 +76,7 @@ func readToken() (tok string, ok bool) {
 
 // ── Event buffer ───────────────────────────────────────────────────────────
 
-var eventBuffer [4096]byte
+var eventBuffer [maxGatewayEventBytes]byte
 
 //export gateway_event_buf
 func gateway_event_buf() uint32 {
@@ -85,7 +85,7 @@ func gateway_event_buf() uint32 {
 
 //export gateway_event_buf_size
 func gateway_event_buf_size() uint32 {
-	return 4096
+	return uint32(len(eventBuffer))
 }
 
 //export gateway_abi_version
@@ -164,27 +164,94 @@ var (
 const (
 	durableStateKey      = "telegram.gateway.v1"
 	maxPendingUpdates    = 16
-	maxDurableStateBytes = 48 * 1024
-	maxPendingEventBytes = 3 * 1024
+	maxDurableStateBytes = 2 << 20
+	maxGatewayEventBytes = 64 << 10
+	maxTelegramTextBytes = 16 << 10
 	maxDeliveryIDBytes   = 256
-	durableStateHeadroom = maxPendingEventBytes + 512
+	maxSkippedUpdates    = 64
+	durableStateHeadroom = maxGatewayEventBytes + 1024
+	maxHTTPResponseBytes = 4 << 20
 )
 
 type durableState struct {
 	Offset     int64           `json:"offset,omitempty"`
 	Pending    []pendingUpdate `json:"pending,omitempty"`
 	Deliveries []string        `json:"deliveries,omitempty"`
+	Skipped    []skippedUpdate `json:"skipped,omitempty"`
 }
 
 type pendingUpdate struct {
-	UpdateID int64           `json:"update_id"`
-	Event    json.RawMessage `json:"event,omitempty"`
-	Acked    bool            `json:"acked,omitempty"`
-	Blocked  string          `json:"blocked,omitempty"`
-	Emitted  bool            `json:"-"`
+	UpdateID   int64           `json:"update_id"`
+	Event      json.RawMessage `json:"event,omitempty"`
+	Acked      bool            `json:"acked,omitempty"`
+	SkipReason string          `json:"skip_reason,omitempty"`
+	Emitted    bool            `json:"-"`
 }
 
-var durableStateBuf [65536]byte
+type skippedUpdate struct {
+	UpdateID int64  `json:"update_id"`
+	Reason   string `json:"reason"`
+}
+
+// telegramMedia is the common metadata subset exposed by Telegram's media
+// objects. File bytes remain at Telegram and are never put in Gateway events.
+type telegramMedia struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Filename     string `json:"file_name"`
+	MIMEType     string `json:"mime_type"`
+	FileSize     int64  `json:"file_size"`
+}
+
+type mediaReference struct {
+	Type           string `json:"type"`
+	MediaID        string `json:"media_id"`
+	UniqueID       string `json:"unique_id,omitempty"`
+	Filename       string `json:"filename,omitempty"`
+	MIMEType       string `json:"mime_type,omitempty"`
+	SizeBytes      int64  `json:"size_bytes,omitempty"`
+	Caption        string `json:"caption,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+}
+
+func telegramMediaReferences(messageID, chatID int64, caption string, photos []telegramMedia, document, audio, voice, video *telegramMedia) []mediaReference {
+	refs := make([]mediaReference, 0, 5)
+	if len(photos) > 0 {
+		largest := photos[0]
+		for _, photo := range photos[1:] {
+			if photo.FileSize >= largest.FileSize {
+				largest = photo
+			}
+		}
+		refs = appendMediaReference(refs, "image", largest, messageID, chatID, caption)
+	}
+	refs = appendTelegramMedia(refs, "file", document, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "audio", audio, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "audio", voice, messageID, chatID, caption)
+	refs = appendTelegramMedia(refs, "video", video, messageID, chatID, caption)
+	return refs
+}
+
+func appendTelegramMedia(refs []mediaReference, mediaType string, media *telegramMedia, messageID, chatID int64, caption string) []mediaReference {
+	if media == nil {
+		return refs
+	}
+	return appendMediaReference(refs, mediaType, *media, messageID, chatID, caption)
+}
+
+func appendMediaReference(refs []mediaReference, mediaType string, media telegramMedia, messageID, chatID int64, caption string) []mediaReference {
+	if media.FileID == "" {
+		return refs
+	}
+	return append(refs, mediaReference{
+		Type: mediaType, MediaID: media.FileID, UniqueID: media.FileUniqueID,
+		Filename: media.Filename, MIMEType: media.MIMEType, SizeBytes: media.FileSize,
+		Caption: caption, MessageID: strconv.FormatInt(messageID, 10), ConversationID: strconv.FormatInt(chatID, 10),
+	})
+}
+
+var durableStateBuf [maxDurableStateBytes]byte
 
 func loadDurableState() bool {
 	key := []byte(durableStateKey)
@@ -230,13 +297,21 @@ func validDurableState() bool {
 	}
 	previous := int64(-1)
 	for _, pending := range durable.Pending {
-		if pending.UpdateID < 0 || pending.UpdateID <= previous || len(pending.Event) > maxPendingEventBytes {
+		if pending.UpdateID < 0 || pending.UpdateID <= previous || len(pending.Event) > maxGatewayEventBytes || pending.SkipReason != "" && !pending.Acked {
 			return false
 		}
 		previous = pending.UpdateID
 	}
 	for _, deliveryID := range durable.Deliveries {
 		if deliveryID == "" || len(deliveryID) > maxDeliveryIDBytes {
+			return false
+		}
+	}
+	if len(durable.Skipped) > maxSkippedUpdates {
+		return false
+	}
+	for _, skipped := range durable.Skipped {
+		if skipped.UpdateID < 0 || skipped.Reason == "" || len(skipped.Reason) > 128 {
 			return false
 		}
 	}
@@ -255,6 +330,12 @@ func pendingIndex(updateID int64) int {
 
 func advanceAcceptedPrefix() {
 	for len(durable.Pending) > 0 && durable.Pending[0].Acked {
+		if durable.Pending[0].SkipReason != "" {
+			durable.Skipped = append(durable.Skipped, skippedUpdate{UpdateID: durable.Pending[0].UpdateID, Reason: durable.Pending[0].SkipReason})
+			if len(durable.Skipped) > maxSkippedUpdates {
+				durable.Skipped = durable.Skipped[len(durable.Skipped)-maxSkippedUpdates:]
+			}
+		}
 		if next := durable.Pending[0].UpdateID + 1; next > offset {
 			offset = next
 		}
@@ -276,11 +357,6 @@ func emitPending() {
 func pendingBackpressure() bool {
 	if len(durable.Pending) >= maxPendingUpdates {
 		return true
-	}
-	for _, pending := range durable.Pending {
-		if pending.Blocked != "" {
-			return true
-		}
 	}
 	data, ok := marshalDurableState()
 	return !ok || len(data) > maxDurableStateBytes-durableStateHeadroom
@@ -326,6 +402,10 @@ func appendPending(pending pendingUpdate) bool {
 		return false
 	}
 	return true
+}
+
+func appendSkipped(updateID int64, reason string) bool {
+	return appendPending(pendingUpdate{UpdateID: updateID, Acked: true, SkipReason: reason})
 }
 
 // ── JSON array URL encoding ───────────────────────────────────────────────
@@ -376,10 +456,6 @@ func gatewayPoll() int32 {
 	// Restored, unacknowledged updates are retried before asking Telegram for
 	// newer work. Emitted is intentionally process-local and resets on restart.
 	for i := range durable.Pending {
-		if durable.Pending[i].Blocked != "" {
-			emitLog("gateway_poll: pending update requires backpressure: " + durable.Pending[i].Blocked)
-			return 0
-		}
 		if !durable.Pending[i].Acked && !durable.Pending[i].Emitted {
 			emitPending()
 			return 0
@@ -399,13 +475,15 @@ func gatewayPoll() int32 {
 	if offset > 0 {
 		url += "&offset=" + strconv.FormatInt(offset, 10)
 	}
+	url += "&limit=" + strconv.Itoa(maxPendingUpdates-len(durable.Pending))
 	if encoded := encodeJSONArray(allowedUpdates); encoded != "" {
 		url += "&allowed_updates=" + encoded
 	}
 
 	emitLog("gateway_poll: getUpdates")
 
-	// HTTP GET via host import. 4 KB response buffer.
+	// HTTP GET via the bounded host capability. The queue-specific Telegram
+	// limit keeps normal responses well below this explicit safety ceiling.
 	var result [12]byte // [written:4][err:4][status:4]
 	hostHTTPGet(
 		uint32(uintptr(unsafe.Pointer(unsafe.StringData(url)))),
@@ -444,8 +522,14 @@ func gatewayPoll() int32 {
 					ID   int64  `json:"id"`
 					Type string `json:"type"`
 				} `json:"chat"`
-				Date int64  `json:"date"`
-				Text string `json:"text"`
+				Date     int64           `json:"date"`
+				Text     string          `json:"text"`
+				Caption  string          `json:"caption"`
+				Photo    []telegramMedia `json:"photo"`
+				Document *telegramMedia  `json:"document"`
+				Audio    *telegramMedia  `json:"audio"`
+				Voice    *telegramMedia  `json:"voice"`
+				Video    *telegramMedia  `json:"video"`
 			} `json:"message"`
 		} `json:"result"`
 	}
@@ -469,10 +553,9 @@ func gatewayPoll() int32 {
 			continue
 		}
 		pending := pendingUpdate{UpdateID: u.UpdateID}
-		if u.Message == nil || u.Message.Text == "" {
+		if u.Message == nil {
 			emitLog("gateway_poll: unsupported update type")
-			pending.Acked = true
-			if !appendPending(pending) {
+			if !appendSkipped(u.UpdateID, "unsupported_update_type") {
 				break
 			}
 			changed = true
@@ -480,26 +563,47 @@ func gatewayPoll() int32 {
 		}
 		if u.Message.MessageID <= 0 || u.Message.Chat.ID == 0 || u.Message.From == nil || u.Message.From.ID <= 0 || u.Message.From.IsBot {
 			emitLog("gateway_poll: unsupported message sender")
-			pending.Acked = true
-			if !appendPending(pending) {
+			if !appendSkipped(u.UpdateID, "invalid_sender") {
 				break
 			}
 			changed = true
 			continue
 		}
-		// Emit a gateway event in GatewayEventEnvelope format.
+		media := telegramMediaReferences(u.Message.MessageID, u.Message.Chat.ID, u.Message.Caption, u.Message.Photo, u.Message.Document, u.Message.Audio, u.Message.Voice, u.Message.Video)
+		text := u.Message.Text
+		if text == "" {
+			text = u.Message.Caption
+		}
+		if text == "" && len(media) == 0 {
+			emitLog("gateway_poll: unsupported message content")
+			if !appendSkipped(u.UpdateID, "unsupported_message_content") {
+				break
+			}
+			changed = true
+			continue
+		}
+		if len(text) > maxTelegramTextBytes {
+			emitLog("gateway_poll: text exceeds Telegram safety limit")
+			if !appendSkipped(u.UpdateID, "text_exceeds_safety_limit") {
+				break
+			}
+			changed = true
+			continue
+		}
+		// Emit a small metadata envelope. Media bytes are never embedded.
 		evt := struct {
-			EventVersion int    `json:"event_version"`
-			EventType    string `json:"event_type"`
-			Source       string `json:"source"`
-			UpdateID     int64  `json:"update_id"`
-			MessageID    int64  `json:"message_id"`
-			ChatID       int64  `json:"chat_id"`
-			ChatType     string `json:"chat_type"`
-			SenderID     int64  `json:"sender_id,omitempty"`
-			SenderName   string `json:"sender_name,omitempty"`
-			Text         string `json:"text"`
-			ReceivedAt   int64  `json:"received_at"`
+			EventVersion int              `json:"event_version"`
+			EventType    string           `json:"event_type"`
+			Source       string           `json:"source"`
+			UpdateID     int64            `json:"update_id"`
+			MessageID    int64            `json:"message_id"`
+			ChatID       int64            `json:"chat_id"`
+			ChatType     string           `json:"chat_type"`
+			SenderID     int64            `json:"sender_id,omitempty"`
+			SenderName   string           `json:"sender_name,omitempty"`
+			Text         string           `json:"text"`
+			Media        []mediaReference `json:"media,omitempty"`
+			ReceivedAt   int64            `json:"received_at"`
 		}{
 			EventVersion: 1,
 			EventType:    "message.incoming",
@@ -508,7 +612,8 @@ func gatewayPoll() int32 {
 			MessageID:    u.Message.MessageID,
 			ChatID:       u.Message.Chat.ID,
 			ChatType:     u.Message.Chat.Type,
-			Text:         u.Message.Text,
+			Text:         text,
+			Media:        media,
 			ReceivedAt:   u.Message.Date,
 		}
 		if u.Message.From != nil {
@@ -520,14 +625,13 @@ func gatewayPoll() int32 {
 			emitLog("gateway_poll: marshal event: " + err.Error())
 			continue
 		}
-		if len(data) > maxPendingEventBytes {
-			emitLog("gateway_poll: update exceeds durable event limit")
-			pending.Blocked = "oversized update"
-			if !appendPending(pending) {
+		if len(data) > maxGatewayEventBytes {
+			emitLog("gateway_poll: event exceeds Gateway safety limit")
+			if !appendSkipped(u.UpdateID, "event_exceeds_safety_limit") {
 				break
 			}
 			changed = true
-			break
+			continue
 		}
 		pending.Event = data
 		if !appendPending(pending) {
@@ -546,13 +650,13 @@ func gatewayPoll() int32 {
 	return 0
 }
 
-var responseBuf [4096]byte
+var responseBuf [maxHTTPResponseBytes]byte
 
 // ── Event handler ─────────────────────────────────────────────────────────
 
 //export gateway_handle_event
 func gatewayHandleEvent(ptr uint32, size uint32) int32 {
-	if size == 0 || size > 4096 {
+	if size == 0 || size > uint32(len(eventBuffer)) {
 		emitLog("gateway_handle_event: bad size")
 		return 0
 	}

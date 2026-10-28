@@ -46,12 +46,25 @@ only after Core sends:
 Acknowledgements may arrive out of order, but the cursor advances only through
 the accepted prefix. Pending updates retry after restart and later updates
 cannot skip an earlier unacknowledged update. The guest accepts at most 16
-pending updates, 48 KiB of serialized durable state, and 3 KiB per inbound
-event. It stops requesting new updates while those bounds require backpressure;
-an oversized update remains as a durable blocker so the cursor cannot move past
-it. Missing, invalid, or bot sender identities and unsupported update types are
-logged and never emitted as ordinary user messages. Core remains the final
-identity and permission authority for emitted events.
+pending updates, 2 MiB of serialized durable state, and 64 KiB per structured
+event. It asks Telegram for no more updates than available queue slots and stops
+polling while full. Acknowledgement automatically frees capacity and resumes
+polling. Persistence failure leaves Telegram's cursor unchanged, so restart can
+recover the update.
+
+All valid Telegram text messages are preserved, including the 4,096-character
+maximum, multibyte UTF-8, and JSON escaping. Limits are measured in serialized
+bytes: text has a 16 KiB safety bound, the complete event a 64 KiB bound, and
+the mediated Bot API response a 4 MiB bound. A deliberately unsupported update
+is advanced only through a durable skip record with a diagnostic reason; queue
+capacity never causes a skip. Missing, invalid, or bot sender identities are
+not emitted as user messages. Core remains the final identity and permission
+authority.
+
+Image, document, audio, voice, and video messages emit small `media` references
+containing provider file IDs and metadata. Binary content is never embedded or
+downloaded by this Gateway. A future separately authorized media capability may
+retrieve it from Telegram; the reference itself grants no authority.
 
 For outbound traffic Core sends `session.route`, including its stable
 `delivery_id`, followed by `session.event`. Telegram reports the same ID in

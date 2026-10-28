@@ -88,6 +88,18 @@ func incomingIDs(t *testing.T, messages []contract.GatewayMessage) []int64 {
 	return ids
 }
 
+func incomingEvents(t *testing.T, messages []contract.GatewayMessage) []contract.GatewayEventEnvelope {
+	t.Helper()
+	var events []contract.GatewayEventEnvelope
+	for _, message := range messages {
+		var event contract.GatewayEventEnvelope
+		if message.Type == "outgoing" && json.Unmarshal(message.Payload, &event) == nil && event.EventType == "message.incoming" {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
 func TestInboundAcceptancePersistsAcrossRestart(t *testing.T) {
 	fixture := newProtocolFixture(t, `{"ok":true,"result":[{"update_id":42,"message":{"message_id":1,"from":{"id":9},"chat":{"id":7,"type":"private"},"date":1,"text":"hello"}}]}`)
 	first := fixture.runtime(t, fixture.state)
@@ -128,6 +140,28 @@ func TestInboundAcceptancePersistsAcrossRestart(t *testing.T) {
 	fixture.mu.Unlock()
 	if !strings.Contains(lastPath, "offset=43") {
 		t.Fatalf("accepted cursor path=%q", lastPath)
+	}
+}
+
+func TestPendingPersistenceFailureRecoversAfterRestart(t *testing.T) {
+	fixture := newProtocolFixture(t, `{"ok":true,"result":[{"update_id":42,"message":{"message_id":1,"from":{"id":9},"chat":{"id":7,"type":"private"},"date":1,"text":"hello"}}]}`)
+	first := fixture.runtime(t, fixture.state)
+	fixture.state.FailNextPuts(1)
+	if err := first.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := incomingIDs(t, first.TakeOutbound()); len(got) != 0 {
+		t.Fatalf("event escaped before durable write: %v", got)
+	}
+	if err := first.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	second := fixture.runtime(t, fixture.state)
+	if err := second.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := incomingIDs(t, second.TakeOutbound()); len(got) != 1 || got[0] != 42 {
+		t.Fatalf("recovered emission=%v", got)
 	}
 }
 
@@ -191,6 +225,10 @@ type durableStateFixture struct {
 	Offset     int64             `json:"offset"`
 	Pending    []json.RawMessage `json:"pending"`
 	Deliveries []string          `json:"deliveries"`
+	Skipped    []struct {
+		UpdateID int64  `json:"update_id"`
+		Reason   string `json:"reason"`
+	} `json:"skipped"`
 }
 
 func TestDurableStateCapabilityIsRequired(t *testing.T) {
@@ -374,9 +412,10 @@ func TestPendingQueueBackpressureRestartAndRecovery(t *testing.T) {
 	}
 	fixture.mu.Lock()
 	requests := len(fixture.paths)
+	firstPath := fixture.paths[0]
 	fixture.mu.Unlock()
-	if requests != 1 {
-		t.Fatalf("full queue continued polling: requests=%d", requests)
+	if requests != 1 || !strings.Contains(firstPath, "limit=16") {
+		t.Fatalf("full queue requests=%d path=%q", requests, firstPath)
 	}
 	if err := runtime.Shutdown(); err != nil {
 		t.Fatal(err)
@@ -403,43 +442,92 @@ func TestPendingQueueBackpressureRestartAndRecovery(t *testing.T) {
 	if got := incomingIDs(t, runtime.TakeOutbound()); len(got) != 1 || got[0] != 17 {
 		t.Fatalf("recovered queue emissions=%v", got)
 	}
+	fixture.mu.Lock()
+	resumePath := fixture.paths[len(fixture.paths)-1]
+	fixture.mu.Unlock()
+	if !strings.Contains(resumePath, "limit=1") {
+		t.Fatalf("resume path=%q", resumePath)
+	}
 	state := fixture.stateJSON(t)
 	if state.Offset != 2 || len(state.Pending) != 16 {
 		t.Fatalf("recovered state=%+v", state)
 	}
 	data, _ := fixture.state.get("telegram.gateway.v1")
-	if len(data) > 48*1024 {
+	if len(data) > 2<<20 {
 		t.Fatalf("serialized state bytes=%d", len(data))
 	}
 }
 
-func TestOversizedUpdateBackpressuresAcrossRestart(t *testing.T) {
-	text := strings.Repeat("x", 3300)
-	updates := fmt.Sprintf(`{"ok":true,"result":[{"update_id":1,"message":{"message_id":1,"from":{"id":9},"chat":{"id":7,"type":"private"},"date":1,"text":%q}}]}`, text)
+func TestFullLengthTelegramTextPreserved(t *testing.T) {
+	for name, text := range map[string]string{
+		"maximum ASCII":     strings.Repeat("x", 4096),
+		"maximum multibyte": strings.Repeat("界", 4096),
+		"escaped JSON":      strings.Repeat("\"\\\n<&>", 600),
+	} {
+		t.Run(name, func(t *testing.T) {
+			updates, err := json.Marshal(map[string]any{"ok": true, "result": []any{map[string]any{"update_id": 1, "message": map[string]any{"message_id": 1, "from": map[string]any{"id": 9}, "chat": map[string]any{"id": 7, "type": "private"}, "date": 1, "text": text}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := newProtocolFixture(t, string(updates))
+			runtime := fixture.runtime(t, fixture.state)
+			if err = runtime.Poll(); err != nil {
+				t.Fatal(err)
+			}
+			events := incomingEvents(t, runtime.TakeOutbound())
+			if len(events) != 1 {
+				t.Fatalf("events=%d, want 1", len(events))
+			}
+			if events[0].Text != text {
+				t.Fatalf("text bytes=%d want=%d", len(events[0].Text), len(text))
+			}
+		})
+	}
+}
+
+func TestGenuineSafetyLimitIsDurablySkippedWithoutPoisoningQueue(t *testing.T) {
+	oversized := strings.Repeat("x", 16*1024+1)
+	updates, err := json.Marshal(map[string]any{"ok": true, "result": []any{
+		map[string]any{"update_id": 1, "message": map[string]any{"message_id": 1, "from": map[string]any{"id": 9}, "chat": map[string]any{"id": 7, "type": "private"}, "date": 1, "text": oversized}},
+		map[string]any{"update_id": 2, "message": map[string]any{"message_id": 2, "from": map[string]any{"id": 9}, "chat": map[string]any{"id": 7, "type": "private"}, "date": 1, "text": "valid"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newProtocolFixture(t, string(updates))
+	runtime := fixture.runtime(t, fixture.state)
+	if err = runtime.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := incomingIDs(t, runtime.TakeOutbound()); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("emitted IDs=%v", got)
+	}
+	state := fixture.stateJSON(t)
+	if state.Offset != 2 || len(state.Pending) != 1 || len(state.Skipped) != 1 || state.Skipped[0].Reason != "text_exceeds_safety_limit" {
+		t.Fatalf("durable skip state=%+v", state)
+	}
+	if err = runtime.HandleEvent(contract.Version0, "inbound.accepted", `{"event_id":"2"}`); err != nil {
+		t.Fatal(err)
+	}
+	if state = fixture.stateJSON(t); state.Offset != 3 || len(state.Pending) != 0 {
+		t.Fatalf("recovered state=%+v", state)
+	}
+}
+
+func TestMediaUpdateEmitsReferenceWithoutBinary(t *testing.T) {
+	updates := `{"ok":true,"result":[{"update_id":7,"message":{"message_id":70,"from":{"id":9},"chat":{"id":77,"type":"private"},"date":1,"caption":"look","photo":[{"file_id":"small","file_unique_id":"u1","file_size":10},{"file_id":"large","file_unique_id":"u2","file_size":99}]}}]}`
 	fixture := newProtocolFixture(t, updates)
 	runtime := fixture.runtime(t, fixture.state)
 	if err := runtime.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if got := incomingIDs(t, runtime.TakeOutbound()); len(got) != 0 {
-		t.Fatalf("oversized update emitted=%v", got)
+	events := incomingEvents(t, runtime.TakeOutbound())
+	if len(events) != 1 || events[0].Text != "look" || len(events[0].Media) != 1 {
+		t.Fatalf("events=%+v", events)
 	}
-	state := fixture.stateJSON(t)
-	if state.Offset != 0 || len(state.Pending) != 1 || !strings.Contains(string(state.Pending[0]), "oversized") {
-		t.Fatalf("oversized state=%+v", state)
-	}
-	if err := runtime.Shutdown(); err != nil {
-		t.Fatal(err)
-	}
-	runtime = fixture.runtime(t, fixture.state)
-	if err := runtime.Poll(); err != nil {
-		t.Fatal(err)
-	}
-	fixture.mu.Lock()
-	requests := len(fixture.paths)
-	fixture.mu.Unlock()
-	if requests != 1 {
-		t.Fatalf("oversized pending update repolled: requests=%d", requests)
+	media := events[0].Media[0]
+	if media.Type != "image" || media.MediaID != "large" || media.UniqueID != "u2" || media.SizeBytes != 99 || media.Caption != "look" || media.MessageID != "70" || media.ConversationID != "77" {
+		t.Fatalf("media=%+v", media)
 	}
 }
 
@@ -460,7 +548,7 @@ func TestInvalidSendersAndUnsupportedUpdatesAreNotEmitted(t *testing.T) {
 		t.Fatalf("emitted IDs=%v", got)
 	}
 	state := fixture.stateJSON(t)
-	if state.Offset != 5 || len(state.Pending) != 1 {
+	if state.Offset != 5 || len(state.Pending) != 1 || len(state.Skipped) != 4 {
 		t.Fatalf("unsupported update state=%+v", state)
 	}
 }

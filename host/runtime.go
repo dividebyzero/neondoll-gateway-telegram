@@ -49,7 +49,7 @@ const (
 	httpResultLen = 12
 
 	// maxEventLen bounds inbound event payloads (guest eventBufSize).
-	maxEventLen = 4096
+	maxEventLen = 64 << 10
 
 	// httpTimeout bounds a single host-mediated HTTP request.
 	httpTimeout = 15 * time.Second
@@ -107,7 +107,8 @@ type GatewayRuntime struct {
 	initBarrier func()
 
 	// Guest-owned event buffer address/size, resolved after Start.
-	eventBufPtr uint32
+	eventBufPtr  uint32
+	eventBufSize uint32
 
 	// cfg is the optional gateway configuration (M2.2 boundary).
 	// nil means the runtime is unconfigured: projection/credential
@@ -123,8 +124,9 @@ type GatewayRuntime struct {
 // guest tests. Passing the same store to a new runtime models a Core restart;
 // it is not a competing production persistence implementation.
 type MemoryStateStore struct {
-	mu     sync.Mutex
-	values map[string][]byte
+	mu       sync.Mutex
+	values   map[string][]byte
+	failPuts int
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
@@ -138,10 +140,22 @@ func (s *MemoryStateStore) get(key string) ([]byte, bool) {
 	return append([]byte(nil), value...), ok
 }
 
-func (s *MemoryStateStore) put(key string, value []byte) {
+func (s *MemoryStateStore) put(key string, value []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failPuts > 0 {
+		s.failPuts--
+		return false
+	}
 	s.values[key] = append([]byte(nil), value...)
+	return true
+}
+
+// FailNextPuts injects deterministic durable-state failures for guest tests.
+func (s *MemoryStateStore) FailNextPuts(count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failPuts = count
 }
 
 // Option configures a GatewayRuntime.
@@ -366,6 +380,7 @@ func (r *GatewayRuntime) Start(wasmBytes []byte) error {
 	r.ctx = ctx
 	r.cancel = cancel
 	r.eventBufPtr = eventBufPtr
+	r.eventBufSize = uint32(sizeRes[0])
 	r.state = stateStarted
 	r.mu.Unlock()
 	return nil
@@ -498,7 +513,11 @@ func (r *GatewayRuntime) HandleEvent(version contract.EnvelopeVersion, eventType
 	mod := r.module
 	ctx := r.ctx
 	eventBufPtr := r.eventBufPtr
+	eventBufSize := r.eventBufSize
 	r.mu.Unlock()
+	if uint32(len(enc)) > eventBufSize {
+		return fmt.Errorf("%w: event %d bytes exceeds guest buffer %d", ErrInvalidEvent, len(enc), eventBufSize)
+	}
 
 	if !mod.Memory().Write(eventBufPtr, []byte(enc)) {
 		return fmt.Errorf("%w: write into guest event buffer at %d", ErrClosed, eventBufPtr)
@@ -724,7 +743,9 @@ func (r *GatewayRuntime) hostStatePut(m api.Module, keyPtr, keyLen, valuePtr, va
 	if !keyOK || !valueOK || len(key) == 0 || r.stateStore == nil {
 		return -1
 	}
-	r.stateStore.put(string(key), value)
+	if !r.stateStore.put(string(key), value) {
+		return -1
+	}
 	return 0
 }
 
